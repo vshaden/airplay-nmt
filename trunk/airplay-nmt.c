@@ -17,35 +17,40 @@
 #define MAX_SEND 5120
 #define NL "\r\n"
 
-enum {STATUS_OK=200, STATUS_SWITCHING_PROTOCOLS=101, STATUS_NOT_IMPLEMENTED=501,};
+enum {
+   STATUS_OK=200, STATUS_SWITCHING_PROTOCOLS=101, STATUS_NOT_IMPLEMENTED=501,
+};
 
 static char airplay_url[MAX_SEND];
 
-#define log_printf if (1) {} else printf
+static int loglevel=1;
+
+#define log_printf if (loglevel<2) {} else printf
+#define error_printf if (loglevel<1) {} else printf
 
 char * UrlEncode(char *szText, char* szDst, int bufsize) {
-  char ch; 
-  char szHex[5];
-  int iMax,i,j; 
-  
-  iMax = bufsize-2;
-  szDst[0]='\0';
-  for (i = 0,j=0; szText[i] && j <= iMax; i++) {
-    ch = szText[i];
-    if (isalnum(ch))
-       szDst[j++]=ch;
-    else if (ch == ' ')
-      szDst[j++]='+';
-    else {
-      if (j+2 > iMax) break;
-      szDst[j++]='%';
-      sprintf(szHex, "%-2.2X", ch);
-      strncpy(szDst+j,szHex,2);
-      j += 2;
-    } 
-  }
-  szDst[j]='\0';
-  return szDst;
+   char ch; 
+   char szHex[5];
+   int iMax,i,j; 
+
+   iMax = bufsize-2;
+   szDst[0]='\0';
+   for (i = 0,j=0; szText[i] && j <= iMax; i++) {
+      ch = szText[i];
+      if (isalnum(ch))
+         szDst[j++]=ch;
+      else if (ch == ' ')
+         szDst[j++]='+';
+      else {
+         if (j+2 > iMax) break;
+         szDst[j++]='%';
+         sprintf(szHex, "%-2.2X", ch);
+         strncpy(szDst+j,szHex,2);
+         j += 2;
+      } 
+   }
+   szDst[j]='\0';
+   return szDst;
 }
 void http_response(int filedes, int status, const char *status_string, const char *content)
 {
@@ -70,40 +75,40 @@ static int socket_read(int sockfd, char *response, int response_size, char **bod
    int content_length = -1;
    int remaining = response_size;
    if (response) while (1) {
-      int nbytes = read(sockfd, response+bytes_read, remaining);
-      //fprintf(stderr, "% 6d: [%.*s]\n", nbytes, nbytes < 0 ? 0:nbytes, response+bytes_read);
-      //printf("socket_read: read=%d, %d/%d\n", nbytes, bytes_read, response_size);
-      if (nbytes < 0) {
-         /* Read error. */
-         perror ("read");
-         exit (EXIT_FAILURE);
-      } else if (nbytes == 0) {
-         /* End-of-file. */
-         break;
-      } else {
-         /* Data read. */
-         bytes_read += nbytes;
-         remaining -= nbytes;
-         assert(bytes_read < response_size);
-         response[bytes_read] = '\0';
-         if (content_length < 0) {
-            char *newlines, *found;
-            if (found = strstr(response, "Content-Length:"), found) newlines = strstr(found, NL NL);
-            if (found && newlines) {
-               newlines += strlen(NL NL);
-               content_length = atoi(found + strlen("Content-Length:"));
-               remaining = content_length - (response+bytes_read-newlines);
-               assert(bytes_read+remaining < response_size);
-               if (newlines) {
-                  if (body) *body = newlines;
-                  if (body_length) *body_length = content_length;
+         int nbytes = read(sockfd, response+bytes_read, remaining);
+         //error_printf("% 6d: [%.*s]\n", nbytes, nbytes < 0 ? 0:nbytes, response+bytes_read);
+         //printf("socket_read: read=%d, %d/%d\n", nbytes, bytes_read, response_size);
+         if (nbytes < 0) {
+            /* Read error. */
+            perror ("read");
+            exit (EXIT_FAILURE);
+         } else if (nbytes == 0) {
+            /* End-of-file. */
+            break;
+         } else {
+            /* Data read. */
+            bytes_read += nbytes;
+            remaining -= nbytes;
+            assert(bytes_read < response_size);
+            response[bytes_read] = '\0';
+            if (content_length < 0) {
+               char *newlines, *found;
+               if (found = strstr(response, "Content-Length:"), found) newlines = strstr(found, NL NL);
+               if (found && newlines) {
+                  newlines += strlen(NL NL);
+                  content_length = atoi(found + strlen("Content-Length:"));
+                  remaining = content_length - (response+bytes_read-newlines);
+                  assert(bytes_read+remaining < response_size);
+                  if (newlines) {
+                     if (body) *body = newlines;
+                     if (body_length) *body_length = content_length;
+                  }
                }
+               //error_printf("socket_read: %d/%d (%d)\n", bytes_read, response_size, remaining);
             }
-            //fprintf(stderr, "socket_read: %d/%d (%d)\n", bytes_read, response_size, remaining);
          }
       }
-   }
-   //fprintf(stderr, "socket_read: DONE %d/%d (%d)\n", bytes_read, response_size, remaining);
+   //error_printf("socket_read: DONE %d/%d (%d)\n", bytes_read, response_size, remaining);
    return bytes_read;
 }
 
@@ -128,7 +133,7 @@ int sendCommandGetResponse(struct in_addr sin_addr, int port, const char *cmd, c
 
    /* connect */
    if (s = connect(sockfd, (struct sockaddr *)&server, sizeof(server)), s) {
-      fprintf(stderr, "error connecting.. (%d)", s);
+      error_printf("error connecting.. (%d)", s);
       exit(1);
    }
    s = write(sockfd, cmd, strlen(cmd));
@@ -158,7 +163,7 @@ int sendCommand(int port, const char *cmd)
 
 void ex_program(int sig) {
 #if 1
-   printf("Wake up call ... !!! - Catched signal: %d ... !!\n", sig);
+   error_printf("Wake up call ... !!! - Caught signal: %d ... !!\n", sig);
    fflush(stdout);
    fflush(stderr);
    exit(1);
@@ -194,12 +199,12 @@ static int http_request_with_response(const char *url, char *response, int respo
    memcpy(&sin_addr, he->h_addr_list[0], sizeof sin_addr);
 
    sprintf(command, 
-      "GET %.*s HTTP/1.1"NL
-      "User-Agent: Wget/1.11.2"NL
-      "Accept: */*"NL
-      "Host: %.*s"NL
-      "Connection: Keep-Alive"NL
-      , url+strlen(url)-p, p, p-url, url);
+           "GET %.*s HTTP/1.1"NL
+           "User-Agent: Wget/1.11.2"NL
+           "Accept: */*"NL
+           "Host: %.*s"NL
+           "Connection: Keep-Alive"NL
+           , url+strlen(url)-p, p, p-url, url);
    return sendCommandGetResponse(sin_addr, port, command, response, response_size);
 }
 
@@ -236,7 +241,9 @@ static int http_request(const char *command)
    return s;
 }
 
-typedef enum {MEDIA_STOP, MEDIA_PLAY, MEDIA_PAUSE, MEDIA_RESUME, MEDIA_SEEK, MEDIA_PHOTO} MEDIA_MODES_T;
+typedef enum {
+   MEDIA_STOP, MEDIA_PLAY, MEDIA_PAUSE, MEDIA_RESUME, MEDIA_SEEK, MEDIA_PHOTO
+} MEDIA_MODES_T;
 static const char *modename[] = {"MEDIA_STOP", "MEDIA_PLAY", "MEDIA_PAUSE", "MEDIA_RESUME", "MEDIA_SEEK", "MEDIA_PHOTO"};
 #define countof(x) (sizeof x/sizeof *(x))
 static int get_media_info(int *position, int *duration, int *playing, int *paused, int *stopped, int *buffering, int *seekable)
@@ -284,16 +291,16 @@ static int wait_media_ready(MEDIA_MODES_T mode, MEDIA_MODES_T last_mode, int see
          log_printf("************ media_status = %d ****************\n", media_status);
          //return media_status;
       }
-      if (mode == MEDIA_PAUSE) { 
+      if (mode == MEDIA_PAUSE) {
          if (paused == 1 && !buffering && seekable)
             break;
-      } else if (mode == MEDIA_RESUME) { 
+      } else if (mode == MEDIA_RESUME) {
          if (paused == 0 && !buffering && seekable)
             break;
       } else if (mode == MEDIA_STOP) {
          if (stopped && !buffering)
             break;
-      } else if (mode == MEDIA_SEEK) { 
+      } else if (mode == MEDIA_SEEK) {
          if (seek_offset < 0)
             break;
          if (seekable && !buffering)
@@ -307,15 +314,15 @@ static int wait_media_ready(MEDIA_MODES_T mode, MEDIA_MODES_T last_mode, int see
       }
       if (timeout++ == 250) {
          log_printf("TIMEOUT: wait_media_ready(%s->%s, %d, %d, %d) failed (%d,%d,%d,%d,%d,%d,%d)\n", 
-                 modename[last_mode], modename[mode], seek_offset, *position, *duration,
-                 seekable, playing, paused, stopped, buffering, 0, media_status );
+                    modename[last_mode], modename[mode], seek_offset, *position, *duration,
+                    seekable, playing, paused, stopped, buffering, 0, media_status );
          break;
       }
       usleep(10000); // 0.1s
    }
    log_printf("wait_media_ready(%s->%s, %d, %d, %d) okay (%d,%d,%d,%d,%d,%d,%d)\n", 
-           modename[last_mode], modename[mode], seek_offset, *position, *duration,
-           seekable, playing, paused, stopped, buffering, 0, media_status );
+              modename[last_mode], modename[mode], seek_offset, *position, *duration,
+              seekable, playing, paused, stopped, buffering, 0, media_status );
    return media_status;
 }
 
@@ -332,7 +339,7 @@ static int set_media_mode_ex(MEDIA_MODES_T mode, const char *url, int seek_offse
    if (!duration) duration=&dummy_duration;
    assert(position && duration);
    log_printf("### set_media_mode_ex(%s,%d)\n", modename[mode], seek_offset);
-   if (last_mode == MEDIA_STOP && mode != MEDIA_STOP && mode != MEDIA_PLAY && mode != MEDIA_PHOTO && airplay_url[0]) 
+   if (last_mode == MEDIA_STOP && mode != MEDIA_STOP && mode != MEDIA_PLAY && mode != MEDIA_PHOTO && airplay_url[0])
       set_media_mode_ex(MEDIA_PLAY, airplay_url, seek_offset, position, duration);
    switch (mode) {
    case MEDIA_STOP:
@@ -364,7 +371,7 @@ static int set_media_mode_ex(MEDIA_MODES_T mode, const char *url, int seek_offse
    if (send_command) {
       s = http_request(cmd);
       if (s!=0) {
-         fprintf(stderr, "http_request(%s)=%d\n", cmd, s);
+         error_printf("http_request(%s)=%d\n", cmd, s);
          exit(1);
       }
    }
@@ -521,13 +528,15 @@ static int read_from_client (int filedes)
    return status==STATUS_OK || status==STATUS_SWITCHING_PROTOCOLS ? 0:-status;
 }
 
-int main (void)
+int main (int argc, char *argv[])
 {
    (void) signal(SIGINT, ex_program);
    //(void) signal ( SIGSEGV ,ex_program);
    int sock;
    struct sockaddr_in clientname;
 
+   if (argc > 1 && argv[1][0] == '-' && argv[1][1] == 'v') loglevel = 2;
+printf("loglevel=%d (%d, %s %s\n", loglevel, argc, argv[0], argv[1]);
    /* Create the socket and set it up to accept connections. */
    sock = make_socket (PORT);
    if (listen (sock, 1) < 0) {
@@ -554,8 +563,8 @@ int main (void)
                /* Connection request on original socket. */
                size_t size = sizeof (clientname);
                int new_sock = accept (sock,
-                             (struct sockaddr *) &clientname,
-                             &size);
+                                      (struct sockaddr *) &clientname,
+                                      &size);
                if (new_sock < 0) {
                   perror ("accept");
                   exit (EXIT_FAILURE);
