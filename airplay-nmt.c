@@ -7,6 +7,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 #include <netdb.h>
 #include <string.h> 
 #include <signal.h>
@@ -16,6 +17,9 @@
 #define MAX_RESPONSE 5120
 #define MAX_SEND 5120
 #define NL "\r\n"
+
+static struct sockaddr_in clientname; // hack: make global
+
 
 enum {
    STATUS_OK=200, STATUS_SWITCHING_PROTOCOLS=101, STATUS_NOT_IMPLEMENTED=501,
@@ -37,7 +41,13 @@ char * UrlEncode(char *szText, char* szDst, int bufsize) {
    szDst[0]='\0';
    for (i = 0,j=0; szText[i] && j <= iMax; i++) {
       ch = szText[i];
-      if (isalnum(ch))
+      if (strncmp(szText+i, "://0.0.0.0", sizeof("://0.0.0.0")-1)==0) {
+	strcpy(szDst+j, "://");
+        j += strlen("://");
+	strcpy(szDst+j, inet_ntoa(clientname.sin_addr));
+        j += strlen(inet_ntoa(clientname.sin_addr));
+        i += strlen("://0.0.0.0")-1;
+      } else if (isalnum(ch))
          szDst[j++]=ch;
       else if (ch == ' ')
          szDst[j++]='+';
@@ -182,6 +192,7 @@ static int http_request_with_response(const char *url, char *response, int respo
    char *p;
    int port = 80, ip[4];
    int s;
+   struct in_addr sin_addr;
    s = sscanf(url, "http://%[^:]s:", host);
    p = strstr(url, "//");
    if (p) p = strstr(p, ":");
@@ -190,14 +201,12 @@ static int http_request_with_response(const char *url, char *response, int respo
    if (!p) return -1;
    //printf("parsed [%s] to [%s] %d (%d)\n", url, host, port, s);
 
-   struct in_addr sin_addr;
    struct hostent     *he;
    if ((he = gethostbyname(host)) == NULL) {
       puts("error resolving hostname..");
       exit(1);
    }
    memcpy(&sin_addr, he->h_addr_list[0], sizeof sin_addr);
-
    sprintf(command, 
            "GET %.*s HTTP/1.1"NL
            "User-Agent: Wget/1.11.2"NL
@@ -354,6 +363,8 @@ static int set_media_mode_ex(MEDIA_MODES_T mode, const char *url, int seek_offse
    case MEDIA_PHOTO:
       send_command = 1;
       sprintf(cmd, "http://127.0.0.1:8008/playback?arg0=start_pod&arg1=AirPlayPhoto&arg2=%s&arg3=1&arg4=rot0&arg5=bghide", url);
+      //sprintf(cmd, "http://127.0.0.1:8008/system?arg0=send_key&arg2=source&arg3=flashlite");
+      //sprintf(cmd, "http://127.0.0.1:8008/system?arg0=send_key&arg2=enter");
       break;
    case MEDIA_SEEK:
       assert(seek_offset >= 0);
@@ -533,10 +544,9 @@ int main (int argc, char *argv[])
    (void) signal(SIGINT, ex_program);
    //(void) signal ( SIGSEGV ,ex_program);
    int sock;
-   struct sockaddr_in clientname;
 
    if (argc > 1 && argv[1][0] == '-' && argv[1][1] == 'v') loglevel = 2;
-printf("loglevel=%d (%d, %s %s\n", loglevel, argc, argv[0], argv[1]);
+
    /* Create the socket and set it up to accept connections. */
    sock = make_socket (PORT);
    if (listen (sock, 1) < 0) {
