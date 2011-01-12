@@ -16,7 +16,7 @@
 
 #define PORT      6000
 #define PROXYPORT 7000
-#define MAXMSG  (512000*4)
+#define MAX_HEADER   5120
 #define MAX_RESPONSE 5120
 #define MAX_SEND 5120
 #define NL "\r\n"
@@ -75,48 +75,80 @@ static char *UrlEncode(char *szText, char* szDst, int bufsize)
    return szDst;
 }
 
-static int socket_read(int sockfd, char *response, int response_size, char **body, int *message_length, int direction)
+static char *strnstr(const char *s1, const char *s2, size_t n)
+{
+   char safe = s1[n-1];
+   ((char *)s1)[n-1] = '\0';
+   char *s = strstr(s1, s2);
+   ((char *)s1)[n-1] = safe;
+   return s;
+}
+
+/* reads http header until response_size, NL NL or EOF.
+   may have read some of body, which will be pointed to by body (first byte after NL NL)
+   returns bytes read into response, or negative for error
+*/
+static int http_read_header(int sockfd, char *response, int response_size, char **body, int *body_size)
 {
    int bytes_read=0;
-   int content_length = -1;
-   int remaining = response_size;
-   if (response) while (1) {
-         int nbytes = read(sockfd, response+bytes_read, remaining);
-         error_printf("% 6d: [%.*s]\n", nbytes, nbytes < 0 ? 0:nbytes, response+bytes_read);
-         //printf("socket_read: read=%d, %d/%d\n", nbytes, bytes_read, response_size);
-         if (nbytes < 0) {
-            /* Read error. */
-            //perror_abort("socket_read");
+   if (!response) return 0;
+   if (body) *body = NULL;
+   if (body_size) *body_size = 0;
+   while (1) {
+      int nbytes = read(sockfd, response+bytes_read, response_size-bytes_read);
+      //error_printf("% 6d: [%.*s]\n", nbytes, nbytes < 0 ? 0:nbytes, response+bytes_read);
+      //printf("http_read_header: read=%d, %d/%d\n", nbytes, bytes_read, response_size);
+      if (nbytes < 0) {
+         /* Read error. */
+         //perror_abort("http_read_header");
+         break;
+      } else if (nbytes == 0) {
+         /* End-of-file. */
+         break;
+      } else {
+         /* Data read. */
+         bytes_read += nbytes;
+         assert(bytes_read <= response_size);
+         char *newlines = strnstr(response, NL NL, response_size);
+         if (newlines) { // end of header
+            newlines += strlen(NL NL);
+            char *found=strnstr(response, "Content-Length:", newlines-response);
+            if (body_size) *body_size = found ? atoi(found + STRLEN("Content-Length:")):0;
+            if (body) *body = newlines;
             break;
-         } else if (nbytes == 0) {
-            /* End-of-file. */
-            break;
-         } else {
-            /* Data read. */
-            bytes_read += nbytes;
-            remaining -= nbytes;
-            assert(bytes_read < response_size);
-            response[bytes_read] = '\0';
-            if (content_length < 0) {
-               char *newlines = strstr(response, NL NL), *found=strstr(response, "Content-Length:");
-               if (newlines) { // end of header
-                  newlines += strlen(NL NL);
-                  if (direction)
-                     content_length = found ? atoi(found + STRLEN("Content-Length:")):remaining+(response+bytes_read-newlines)-1;
-                  else
-                     content_length = found ? atoi(found + STRLEN("Content-Length:")):0;
-                  remaining = content_length - (response+bytes_read-newlines);
-                  assert(remaining >= 0);
-                  assert(bytes_read+remaining < response_size);
-                  if (newlines && body) *body = newlines;
-               }
-               //error_printf("socket_read: %d/%d (%d)\n", bytes_read, response_size, remaining);
-            }
          }
       }
-   if (message_length) *message_length = bytes_read;
-   if (message_length && *message_length) error_printf("socket_read: DONE %d/%d (%d)\n[%.*s]...(%d)\n", bytes_read, response_size, remaining, bytes_read-*message_length, response, *message_length);
-   else error_printf("socket_read: DONE %d/%d (%d)\n[%.*s]\n", bytes_read, response_size, remaining, bytes_read, response);
+   }
+   int header_size = body && *body ? *body - response: bytes_read;
+   log_printf("http_read_header(%d): DONE %d/%d\n[%.*s]...%d\n", sockfd, bytes_read, response_size, header_size, response, body_size ? *body_size:0 );
+   return bytes_read;
+}
+
+
+static int socket_read(int sockfd, char *buffer, int length)
+{
+   int bytes_read=0;
+   int remaining = length;
+   if (buffer) while (1) {
+      int nbytes = read(sockfd, buffer+bytes_read, remaining);
+      //error_printf("% 6d: [%.*s]\n", nbytes, nbytes < 0 ? 0:nbytes, response+bytes_read);
+      //printf("socket_read: read=%d, %d/%d\n", nbytes, bytes_read, length);
+      if (nbytes < 0) {
+         /* Read error. */
+         //perror_abort("socket_read");
+         break;
+      } else if (nbytes == 0) {
+            /* End-of-file. */
+            break;
+      } else {
+         /* Data read. */
+         bytes_read += nbytes;
+         remaining -= nbytes;
+         assert(bytes_read <= length);
+      }
+   }
+   if (bytes_read < 4096) log_printf("socket_read(%d): DONE %d/%d (%d)\n[%.*s]\n", sockfd, bytes_read, length, remaining, bytes_read, buffer);
+   else log_printf("socket_read(%d): DONE %d/%d (%d)\n", sockfd, bytes_read, length, remaining);
    return bytes_read;
 }
 
@@ -125,26 +157,28 @@ static int socket_write(int sockfd, const char *buffer, int length)
    int bytes_written=0;
    int remaining = length;
    if (buffer) while (1) {
-         int nbytes = write(sockfd, buffer+bytes_written, remaining);
-         error_printf("% 6d: [%.*s]\n", nbytes, nbytes < 0 ? 0:nbytes, buffer+bytes_written);
-         //printf("socket_write: read=%d, %d/%d\n", nbytes, bytes_read, response_size);
-         if (nbytes < 0) {
-            /* Read error. */
-            //perror_abort("socket_write");
-            break;
-         } else if (nbytes == 0) {
-            /* End-of-file. */
-            break;
-         } else {
-            /* Data read. */
-            bytes_written += nbytes;
-            remaining -= nbytes;
-         }
+      int nbytes = write(sockfd, buffer+bytes_written, remaining);
+      //error_printf("% 6d: [%.*s]\n", nbytes, nbytes < 0 ? 0:nbytes, buffer+bytes_written);
+      //printf("socket_write: read=%d, %d/%d\n", nbytes, bytes_read, response_size);
+      if (nbytes < 0) {
+         /* Read error. */
+         //perror_abort("socket_write");
+         break;
+      } else if (nbytes == 0) {
+         /* End-of-file. */
+         break;
+      } else {
+         /* Data read. */
+         bytes_written += nbytes;
+         remaining -= nbytes;
       }
+   }
+   if (bytes_written < 4096) log_printf("socket_write(%d): DONE %d/%d (%d)\n[%.*s]\n", sockfd, bytes_written, length, remaining, bytes_written, buffer);
+   else log_printf("socket_write(%d): DONE %d/%d (%d)\n", sockfd, bytes_written, length, remaining);
    return bytes_written;
 }
 
-static void http_response(int filedes, int status, const char *status_string, const char *content)
+static void http_response(int sockfd, int status, const char *status_string, const char *content)
 {
    char response[MAX_RESPONSE];
    const time_t ltime=time(NULL); /* get current cal time */
@@ -154,80 +188,46 @@ static void http_response(int filedes, int status, const char *status_string, co
    if (content) strcat(response, ""NL), strcat(response, content);
    strcat(response, ""NL);
    if (status != STATUS_SWITCHING_PROTOCOLS) {log_printf("{%s}\n", response);}
-   int s = socket_write(filedes, response, strlen(response));
+   int s = socket_write(sockfd, response, strlen(response));
    assert(s==strlen(response));
+   log_printf("http_response(%d): DONE (%d)\n[%.*s]\n", sockfd, s, s, content);
+}
+
+
+static int make_socket_out(struct in_addr sin_addr, int port)
+{
+   struct sockaddr_in  server;
+   int s, sockfd = socket(AF_INET,SOCK_STREAM,0);
+
+   if (sockfd==-1) perror_abort("Create socket");
+   /*
+    * copy the network address part of the structure to the 
+    * sockaddr_in structure which is passed to connect() 
+    */
+   memcpy(&server.sin_addr, &sin_addr, sizeof server.sin_addr);
+   server.sin_family = AF_INET;
+   server.sin_port = htons(port);
+
+   /* connect */
+   if (s = connect(sockfd, (struct sockaddr *)&server, sizeof server), s) {
+      perror_abort("error connecting");
+   }
+   log_printf("make_socket_out(%d.%d.%d.%d:%d)=%d\n", (sin_addr.s_addr>>0)&0xff,(sin_addr.s_addr>>8)&0xff,(sin_addr.s_addr>>16)&0xff,(sin_addr.s_addr>>24)&0xff, port, sockfd);
+   return sockfd;
 }
 
 
 int sendCommandGetResponse(struct in_addr sin_addr, int port, const char *cmd, char *response, int response_size)
 {
-   struct sockaddr_in  server;
-   int sockfd=-1;
-   int s;
-
-   sockfd=socket(AF_INET,SOCK_STREAM,0);
-
-   if (sockfd==-1) perror_abort("Create socket");
-
-/*
- * copy the network address part of the structure to the 
- * sockaddr_in structure which is passed to connect() 
- */
-   memcpy(&server.sin_addr, &sin_addr, sizeof server.sin_addr);
-   server.sin_family = AF_INET;
-   server.sin_port = htons(port);
-
-   /* connect */
-   if (s = connect(sockfd, (struct sockaddr *)&server, sizeof server), s) {
-      perror_abort("error connecting");
-   }
-   s = socket_write(sockfd, cmd, strlen(cmd));
+   int sockfd=make_socket_out(sin_addr, port);
+   int s = socket_write(sockfd, cmd, strlen(cmd));
    assert(s == strlen(cmd));
-   log_printf("*[%s]\n", cmd);
-
-   int bytes_read = socket_read(sockfd, response, response_size, NULL, NULL, 0);
+   int bytes_read = socket_read(sockfd, response, response_size);
    close(sockfd);
-   if (bytes_read > 0) {
-      response[bytes_read] = '\0';
-      log_printf("*{%s}\n", response);
-   }
+   response[min(bytes_read, response_size-1)] = '\0';
    return 0;
 }
 
-int sendCommandGetResponse2(struct in_addr sin_addr, int port, const char *cmd, char *response, int response_size, char **body, int *message_length, int direction)
-{
-   struct sockaddr_in  server;
-   int sockfd=-1;
-   int s;
-
-   sockfd=socket(AF_INET,SOCK_STREAM,0);
-
-   if (sockfd==-1) perror_abort("Create socket");
-
-/*
- * copy the network address part of the structure to the 
- * sockaddr_in structure which is passed to connect() 
- */
-   memcpy(&server.sin_addr, &sin_addr, sizeof server.sin_addr);
-   server.sin_family = AF_INET;
-   server.sin_port = htons(port);
-
-   /* connect */
-   if (s = connect(sockfd, (struct sockaddr *)&server, sizeof server), s) {
-      perror_abort("error connecting");
-   }
-   s = socket_write(sockfd, cmd, strlen(cmd));
-   assert(s == strlen(cmd));
-   log_printf("*[%s]\n", cmd);
-
-   int bytes_read = socket_read(sockfd, response, response_size, body, message_length, direction);
-   close(sockfd);
-   if (bytes_read > 0) {
-      response[bytes_read] = '\0';
-      log_printf("*{%s}\n", response);
-   }
-   return 0;
-}
 
 #if 0
 static int sendCommand(int port, const char *cmd)
@@ -269,7 +269,7 @@ static int http_request_with_response(const char *url, char *response, int respo
    if (p) port = atoi(p+1);
    if (p) p = strstr(p, "/");
    if (!p) return -1;
-   printf("parsed [%s] to [%s] %d (%d)\n", url, host, port, s);
+   log_printf("parsed [%s] to [%s] %d (%d)\n", url, host, port, s);
 
    struct hostent     *he;
    if ((he = gethostbyname(host)) == NULL) {
@@ -471,9 +471,8 @@ static int set_media_mode(MEDIA_MODES_T mode)
 }
 
 
-static int make_socket (uint16_t port)
+static int make_socket_in(uint16_t port)
 {
-   //int sock;
    struct sockaddr_in name;
    int reuse_addr = 1;
 
@@ -495,6 +494,7 @@ static int make_socket (uint16_t port)
    if (listen(sock, 1) < 0) {
       perror_abort("listen");
    }
+   log_printf("make_socket_in(:%d)=%d\n", port, sock);
    return sock;
 }
 
@@ -516,15 +516,15 @@ static const char *http_status_string(int status)
 
 static int read_from_client(int filedes)
 {
-   char *buffer = malloc(MAXMSG);
+   char *buffer = malloc(MAX_HEADER+1); // allow null on end
    char *content = malloc(MAX_RESPONSE);
    int nbytes;
    char *found;
    int status = STATUS_OK;
-   char *body=0; int message_length = 0;
+   char *body=0; int body_size = 0;
    assert(buffer && content);
    content[0] = '\0';
-   nbytes = socket_read(filedes, buffer, MAXMSG, &body, &message_length, 0);
+   nbytes = http_read_header(filedes, buffer, MAX_HEADER, &body, &body_size);
    if (nbytes > 0) {
       buffer[nbytes] = '\0';
       if (strstr(buffer, "/reverse")==0) {log_printf("[%s]\n", buffer);}
@@ -596,13 +596,20 @@ static int read_from_client(int filedes)
       set_media_mode(MEDIA_STOP);
    } else if (found = strstr(buffer,"/photo"), found) {
       fprintf (stderr, "Found photo call retrieve content address\n");
-      int body_length = buffer+message_length-body;
-      if (message_length && body) {
+      int s;
+      if (body_size && body) {
+         char *photo = malloc(body_size);
+         const int already_got = body-buffer;
+         assert(photo);
+         memcpy(photo, buffer, already_got);
+         s = socket_read(filedes, photo+already_got, body_size-already_got);
+         assert(s==body_size-already_got);
          FILE *fp = fopen("/tmp/airplay_photo.jpg", "wb");
          assert(fp);
-         int s = fwrite(body, 1, body_length, fp);
-         assert(s==body_length);
+         s = fwrite(photo, 1, body_size, fp);
+         assert(s==body_size);
          fclose(fp);
+         free(photo);
          set_media_mode_url(MEDIA_PHOTO, "file:///tmp/airplay_photo.jpg");
       }
    } else {
@@ -639,21 +646,18 @@ Host: code.google.com
 
 static int read_from_proxy(int filedes)
 {
-   char *buffer = malloc(MAXMSG);
-   char *content = malloc(MAX_RESPONSE);
-   char *response = malloc(MAXMSG);
-   char *response_out = malloc(MAXMSG);
+   char *buffer = malloc(MAX_HEADER+1); // allow null on end
+   char *response_out = malloc(MAX_HEADER);
    int nbytes;
    char *found, *p;
    int status = STATUS_OK;
-   char *body=0; int message_length = 0;
-   assert(buffer && content);
-   content[0] = '\0';
+   char *body=0; int body_size = 0;
+   assert(buffer);
    memset(&proxy, 0, sizeof proxy);
-   nbytes = socket_read(filedes, buffer, MAXMSG, &body, &message_length, 0);
+   nbytes = http_read_header(filedes, buffer, MAX_HEADER, &body, &body_size);
    if (nbytes > 0) {
       buffer[nbytes] = '\0';
-      log_printf("[%s]\n", buffer);
+      assert(body_size == 0);
    } else {
       /* End-of-file. */
       assert(nbytes == 0);
@@ -683,11 +687,11 @@ static int read_from_proxy(int filedes)
               struct hostent *he;
               //printf("parsed [%s] to [%s]:%d (%d.%d.%d.%d)\n", buffer, found, proxy.port, (proxy.sin_addr.s_addr>>0)&0xff,(proxy.sin_addr.s_addr>>8)&0xff,(proxy.sin_addr.s_addr>>16)&0xff,(proxy.sin_addr.s_addr>>24)&0xff);
               if ((he = gethostbyname(proxy.host)) == NULL) {
-                 printf("parsed [%s]:%d (%d.%d.%d.%d)\n", proxy.host, proxy.port, (proxy.sin_addr.s_addr>>0)&0xff,(proxy.sin_addr.s_addr>>8)&0xff,(proxy.sin_addr.s_addr>>16)&0xff,(proxy.sin_addr.s_addr>>24)&0xff);
+                 log_printf("parsed [%s] (%d.%d.%d.%d:%d)\n", proxy.host, (proxy.sin_addr.s_addr>>0)&0xff,(proxy.sin_addr.s_addr>>8)&0xff,(proxy.sin_addr.s_addr>>16)&0xff,(proxy.sin_addr.s_addr>>24)&0xff, proxy.port);
 	         perror_abort("error resolving hostname");
               }
               memcpy(&proxy.sin_addr, he->h_addr_list[0], sizeof proxy.sin_addr);
-              printf("parsed [%s]:%d (%d.%d.%d.%d)\n", proxy.host, proxy.port, (proxy.sin_addr.s_addr>>0)&0xff,(proxy.sin_addr.s_addr>>8)&0xff,(proxy.sin_addr.s_addr>>16)&0xff,(proxy.sin_addr.s_addr>>24)&0xff);
+              log_printf("parsed [%s] (%d.%d.%d.%d:%d)\n", proxy.host, (proxy.sin_addr.s_addr>>0)&0xff,(proxy.sin_addr.s_addr>>8)&0xff,(proxy.sin_addr.s_addr>>16)&0xff,(proxy.sin_addr.s_addr>>24)&0xff, proxy.port);
            }
            if (found_useragent) {
               found = found_useragent + STRLEN("useragent=");
@@ -696,7 +700,7 @@ static int read_from_proxy(int filedes)
               if (p=strstr(found, "\n"), p) { *p='\0'; }
               strncpy(proxy.useragent, found, sizeof proxy.useragent);
               proxy.useragent[(sizeof proxy.useragent)-1] = '\0';
-              printf("parsed userent [%s]\n", proxy.useragent);
+              log_printf("parsed useragent [%s]\n", proxy.useragent);
            }
         } else {
            if (strncasecmp(tok, "GET ", STRLEN("GET ")) == 0)
@@ -715,7 +719,7 @@ static int read_from_proxy(int filedes)
         d += sprintf(d, "User-Agent: %s"NL, proxy.useragent);
      } else {
         d += sprintf(d, "%s"NL, tok);
-        assert(d < response_out + MAXMSG);
+        assert(d < response_out + MAX_HEADER);
      }
      if (next_tok = strstr(last_tok, NL), next_tok) tok = last_tok, *next_tok = '\0', last_tok = next_tok + strlen(NL); else tok = NULL;
    }
@@ -733,16 +737,31 @@ GET>
              >OK
 OK<
 */
-   int s = sendCommandGetResponse2(proxy.sin_addr, proxy.port, response_out, response, MAXMSG, &body, &message_length, 1);
-   assert(s==0);
-   socket_write(filedes, response, message_length);
-   status = 1;
+   assert(body_size == 0);
+   int s, sockfd = make_socket_out(proxy.sin_addr, proxy.port);
+   s = socket_write(sockfd, response_out, strlen(response_out));
+   assert(s == strlen(response_out));
 
-   if (status!=0 && status!=1) http_response(filedes, status, http_status_string(status), content[0] ? content:NULL);
+   nbytes = http_read_header(sockfd, buffer, MAX_HEADER, &body, &body_size);
+   s = socket_write(filedes, buffer, nbytes);
+   assert(s == nbytes);
+   const int header_length = body-buffer;
+   int remaining = header_length + body_size - nbytes;
+   while (remaining) {
+     int nbytes = socket_read(sockfd, buffer, min(remaining, MAX_HEADER));
+     assert(nbytes >= 0);
+     if (nbytes > 0) {
+        s = socket_write(filedes, buffer, nbytes);
+        assert(s == nbytes);
+        remaining -= nbytes;
+     }
+   //fprintf(stderr, "%d/%d\n", nbytes, remaining);
+   }
+   assert(remaining == 0);
+   close(sockfd);
+   status = 1;
 fail:
    if (buffer) free(buffer);
-   if (content) free(content);
-   if (response) free(response);
    if (response_out) free(response_out);
    return status==STATUS_OK || status==STATUS_SWITCHING_PROTOCOLS ? 0:-status;
 }
@@ -752,9 +771,9 @@ static void *proxy_thread(void *arg)
    int i, s;
    fd_set active_fd_set, read_fd_set;
    /* Create the socket and set it up to accept connections. */
-   int sock = make_socket(PROXYPORT);
+   int sock = make_socket_in(PROXYPORT);
 
-   printf("proxy_thread. sock=%i\n", sock);
+   log_printf("proxy_thread. sock=%i\n", sock);
 
    /* Initialize the set of active sockets. */
    FD_ZERO(&active_fd_set);
@@ -776,7 +795,7 @@ static void *proxy_thread(void *arg)
                if (new_sock < 0) {
                   perror_abort("accept");
                }
-               fprintf(stderr, "%i) Server: proxy connect from host %s, port %d.\n", i, inet_ntoa(clientname_proxy.sin_addr), ntohs(clientname_proxy.sin_port));
+               log_printf("%i) Proxy: connect from (%s:%d)=%d\n", i, inet_ntoa(clientname_proxy.sin_addr), ntohs(clientname_proxy.sin_port), new_sock);
                FD_SET(new_sock, &active_fd_set);
             } else {
                /* Data arriving on an already-connected socket. */
@@ -790,7 +809,6 @@ static void *proxy_thread(void *arg)
          }
       }
    }
-
 }
 
 int main (int argc, char *argv[])
@@ -808,7 +826,7 @@ int main (int argc, char *argv[])
    assert(s==0);
 
    /* Create the socket and set it up to accept connections. */
-   sock = make_socket(PORT);
+   sock = make_socket_in(PORT);
 
    /* Initialize the set of active sockets. */
    FD_ZERO(&active_fd_set);
@@ -831,7 +849,7 @@ int main (int argc, char *argv[])
                if (new_sock < 0) {
                   perror_abort("accept");
                }
-               fprintf(stderr, "%i) Server: connect from host %s, port %d.\n", i, inet_ntoa(clientname.sin_addr), ntohs(clientname.sin_port));
+               log_printf("%i) Server: connect from (%s:%d)=%d\n", i, inet_ntoa(clientname.sin_addr), ntohs(clientname.sin_port), new_sock);
                FD_SET(new_sock, &active_fd_set);
             } else {
                /* Data arriving on an already-connected socket. */
