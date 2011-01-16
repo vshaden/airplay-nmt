@@ -39,7 +39,7 @@ static int loglevel=1;
 #define STRLEN(s) (sizeof(s)-1)
 #define perror_abort(s) do {perror(s); exit(EXIT_FAILURE);}while(0)
 
-static char *UrlEncode(char *szText, char* szDst, int bufsize)
+static char *UrlEncode(char *szText, char* szDst, int bufsize, int want_proxy)
 {
    char ch; 
    char szHex[5];
@@ -49,16 +49,16 @@ static char *UrlEncode(char *szText, char* szDst, int bufsize)
    szDst[0]='\0';
    for (i = 0,j=0; szText[i] && j <= iMax; i++) {
       ch = szText[i];
-      if (strncmp(szText+i, "http://", STRLEN("http://"))==0) {
-	strcpy(szDst+j, "http://127.0.0.1:7000/proxy?url=http");
-        j += STRLEN("http://127.0.0.1:7000/proxy?url=http");
-        i += STRLEN("http")-1;
+      if (want_proxy && strncmp(szText+i, "http://", STRLEN("http://"))==0) {
+         strcpy(szDst+j, "http://127.0.0.1:7000/proxy?url=http");
+         j += STRLEN("http://127.0.0.1:7000/proxy?url=http");
+         i += STRLEN("http")-1;
       } else if (strncmp(szText+i, "://0.0.0.0", STRLEN("://0.0.0.0"))==0) {
-	strcpy(szDst+j, "://");
-        j += STRLEN("://");
-	strcpy(szDst+j, inet_ntoa(clientname.sin_addr));
-        j += strlen(inet_ntoa(clientname.sin_addr));
-        i += STRLEN("://0.0.0.0")-1;
+         strcpy(szDst+j, "://");
+         j += STRLEN("://");
+         strcpy(szDst+j, inet_ntoa(clientname.sin_addr));
+         j += strlen(inet_ntoa(clientname.sin_addr));
+         i += STRLEN("://0.0.0.0")-1;
       } else if (isalnum(ch) || ch=='/' || ch==':' || ch=='.' || ch=='_' || ch=='-')
          szDst[j++]=ch;
       else if (ch == ' ')
@@ -130,23 +130,22 @@ static int socket_read(int sockfd, char *buffer, int length)
    int bytes_read=0;
    int remaining = length;
    if (buffer) while (1) {
-      int nbytes = read(sockfd, buffer+bytes_read, remaining);
-      //error_printf("% 6d: [%.*s]\n", nbytes, nbytes < 0 ? 0:nbytes, response+bytes_read);
-      //printf("socket_read: read=%d, %d/%d\n", nbytes, bytes_read, length);
-      if (nbytes < 0) {
-         /* Read error. */
-         //perror_abort("socket_read");
-         break;
-      } else if (nbytes == 0) {
+         int nbytes = read(sockfd, buffer+bytes_read, remaining);
+         //error_printf("% 6d: [%.*s]\n", nbytes, nbytes < 0 ? 0:nbytes, response+bytes_read);
+         if (nbytes < 0) {
+            /* Read error. */
+            //perror_abort("socket_read");
+            break;
+         } else if (nbytes == 0) {
             /* End-of-file. */
             break;
-      } else {
-         /* Data read. */
-         bytes_read += nbytes;
-         remaining -= nbytes;
-         assert(bytes_read <= length);
+         } else {
+            /* Data read. */
+            bytes_read += nbytes;
+            remaining -= nbytes;
+            assert(bytes_read <= length);
+         }
       }
-   }
    if (bytes_read < 4096) log_printf("socket_read(%d): DONE %d/%d (%d)\n[%.*s]\n", sockfd, bytes_read, length, remaining, bytes_read, buffer);
    else log_printf("socket_read(%d): DONE %d/%d (%d)\n", sockfd, bytes_read, length, remaining);
    return bytes_read;
@@ -157,22 +156,26 @@ static int socket_write(int sockfd, const char *buffer, int length)
    int bytes_written=0;
    int remaining = length;
    if (buffer) while (1) {
-      int nbytes = write(sockfd, buffer+bytes_written, remaining);
-      //error_printf("% 6d: [%.*s]\n", nbytes, nbytes < 0 ? 0:nbytes, buffer+bytes_written);
-      //printf("socket_write: read=%d, %d/%d\n", nbytes, bytes_read, response_size);
-      if (nbytes < 0) {
-         /* Read error. */
-         //perror_abort("socket_write");
-         break;
-      } else if (nbytes == 0) {
-         /* End-of-file. */
-         break;
-      } else {
-         /* Data read. */
-         bytes_written += nbytes;
-         remaining -= nbytes;
+         int nbytes = write(sockfd, buffer+bytes_written, remaining);
+         //error_printf("% 6d: [%.*s]\n", nbytes, nbytes < 0 ? 0:nbytes, buffer+bytes_written);
+         //printf("socket_write: read=%d, %d/%d\n", nbytes, bytes_read, response_size);
+         if (nbytes < 0) {
+            /* Write error. */
+            if (bytes_written < length) {
+               error_printf("socket_write(%d)=%d: DONE %d/%d (%d)\n", sockfd, nbytes, bytes_written, length, remaining);
+               break;
+               //perror_abort("socket_write");
+            }
+            break;
+         } else if (nbytes == 0) {
+            /* End-of-file. */
+            break;
+         } else {
+            /* Data read. */
+            bytes_written += nbytes;
+            remaining -= nbytes;
+         }
       }
-   }
    if (bytes_written < 4096) log_printf("socket_write(%d): DONE %d/%d (%d)\n[%.*s]\n", sockfd, bytes_written, length, remaining, bytes_written, buffer);
    else log_printf("socket_write(%d): DONE %d/%d (%d)\n", sockfd, bytes_written, length, remaining);
    return bytes_written;
@@ -187,10 +190,10 @@ static void http_response(int sockfd, int status, const char *status_string, con
    else sprintf(response, "HTTP/1.1 %d %s"NL "Date: %s" "Content-Length:%d"NL, status, status_string, date, content ? strlen(content)+2:0);
    if (content) strcat(response, ""NL), strcat(response, content);
    strcat(response, ""NL);
-   if (status != STATUS_SWITCHING_PROTOCOLS) {log_printf("{%s}\n", response);}
+   //if (status != STATUS_SWITCHING_PROTOCOLS) {log_printf("{%s}\n", response);}
    int s = socket_write(sockfd, response, strlen(response));
    assert(s==strlen(response));
-   log_printf("http_response(%d): DONE (%d)\n[%.*s]\n", sockfd, s, s, content);
+   //log_printf("http_response(%d): DONE (%d)\n[%.*s]\n", sockfd, s, s, content);
 }
 
 
@@ -241,6 +244,10 @@ static int sendCommand(int port, const char *cmd)
    return sendCommandGetResponse(sin_addr, port, cmd, NULL, 0);
 }
 #endif
+
+static void ignore_signal(int sig) {
+   error_printf("Ignored signal %d\n", sig);
+}
 
 static void ex_program(int sig) {
 #if 1
@@ -355,6 +362,46 @@ static int get_photo_info(int *position, int *duration, int *playing, int *pause
    return !values[0];
 }
 
+static int get_system_mode(int *browser, int *pod_playback, int *vod_playback)
+{
+   const char *keys[] = {"?<returnValue>0", "?<apps>browser", "?<apps>POD_playback", "<apps>VOD_playback", NULL};
+   int values[countof(keys)]={0};
+   http_request_and_parse_nums("http://127.0.0.1:8008/system?arg0=get_current_app", keys, values);
+   if (browser) *browser=values[1];
+   if (pod_playback) *pod_playback =values[2];
+   if (vod_playback) *vod_playback=values[3];
+   return !values[0];
+}
+#ifdef A100
+static void send_ir_key(char *str)
+{
+   FILE *fp = fopen("/tmp/ir_key", "wb");
+   if (fp) {
+      fprintf (fp ,"%s\n", str);
+      fclose(fp);
+      log_printf("Wrote %s to /tmp/ir_key\n", str);
+   } else assert(0);
+}
+#else
+static void send_ir_key(char *str)
+{
+   int s, sockfd;
+   struct in_addr sin_addr;
+   struct hostent     *he;
+   if ((he = gethostbyname("localhost")) == NULL) {
+      perror_abort("error resolving hostname");
+   }
+   memcpy(&sin_addr, he->h_addr_list[0], sizeof sin_addr);
+
+   sockfd = make_socket_out(sin_addr, 30000);
+   if (sockfd > 0) {
+      s = socket_write(sockfd, str, strlen(str));
+      assert(s == strlen(str));
+      close(sockfd);
+   } else assert(0);
+}
+#endif
+
 static int wait_media_ready(MEDIA_MODES_T mode, MEDIA_MODES_T last_mode, int seek_offset, int *position, int *duration)
 {
    int seekable = 0, playing = 0, paused=0, stopped=0, buffering=0;
@@ -362,13 +409,18 @@ static int wait_media_ready(MEDIA_MODES_T mode, MEDIA_MODES_T last_mode, int see
    int media_status;
    assert(position && duration);
    while (1) {
-      if (mode == MEDIA_PHOTO)
+      if (mode == MEDIA_PHOTO || last_mode == MEDIA_PHOTO) {
          media_status = get_photo_info(position, duration, &playing, &paused, &stopped, &buffering, &seekable);
-      else
+         if (media_status!=0) {
+            log_printf("************ media_status = %d ****************\n", media_status);
+            stopped = 1;
+         }
+      } else {
          media_status = get_media_info(position, duration, &playing, &paused, &stopped, &buffering, &seekable);
-      if (media_status!=0) {
-         log_printf("************ media_status = %d ****************\n", media_status);
-         //return media_status;
+         if (media_status!=0) {
+            log_printf("************ media_status = %d ****************\n", media_status);
+            //return media_status;
+         }
       }
       if (mode == MEDIA_PAUSE) {
          if (paused == 1 && !buffering && seekable)
@@ -406,6 +458,7 @@ static int wait_media_ready(MEDIA_MODES_T mode, MEDIA_MODES_T last_mode, int see
 }
 
 static int last_scrub=0, last_position=0, last_duration = 0;
+#ifndef A100
 static int set_media_mode_ex(MEDIA_MODES_T mode, const char *url, int seek_offset, int *position, int *duration)
 {
    char cmd[MAX_SEND];
@@ -453,12 +506,76 @@ static int set_media_mode_ex(MEDIA_MODES_T mode, const char *url, int seek_offse
       assert(s==0);
    }
    media_status = wait_media_ready(mode, last_mode, seek_offset, position, duration);
+   if (mode==MEDIA_PHOTO) {
+      int browser, pod_playback, vod_playback;
+      s = get_system_mode(&browser, &pod_playback, &vod_playback);
+      assert(s==0);
+      if (!pod_playback) {
+         usleep(100000);
+         send_ir_key("B\n");
+         //http_request("http://127.0.0.1:8008/system?arg0=send_key&arg2=source&arg3=browser");
+         //usleep(100000);
+         //http_request("http://127.0.0.1:8008/system?arg0=send_key&arg2=enter");
+      }
+   } else if (mode==MEDIA_STOP && last_mode==MEDIA_PHOTO) {
+      int browser, pod_playback, vod_playback;
+      s = get_system_mode(&browser, &pod_playback, &vod_playback);
+      assert(s==0);
+      if (!browser) {
+         usleep(100000);
+         send_ir_key("xx");
+      }
+   }
    if (mode==MEDIA_STOP) {
       last_scrub =-1; last_position = 0, last_duration = 0;
    }
    last_mode = media_status==0 ? mode : MEDIA_STOP;
    return media_status;
 }
+#else
+static int set_media_mode_ex(MEDIA_MODES_T mode, const char *url, int seek_offset, int *position, int *duration)
+{
+   int s;
+   FILE *fp;
+   char cmd[MAX_SEND];
+   log_printf("### set_media_mode_ex(%s,%d)\n", modename[mode], seek_offset);
+   switch (mode) {
+   default: break;
+   case MEDIA_STOP:
+      send_ir_key("212");
+      break;
+   case MEDIA_PLAY:
+   case MEDIA_PHOTO:
+#if 1
+      sprintf(cmd,"/bin/mono -single %s -dram 1\n", url);
+      system(cmd);
+#else
+      fp = fopen("/tmp/runme.html", "wb");
+      if (fp) {
+         fprintf (fp ,"<body bgcolor=black link=black onloadset='go'>");
+         fprintf (fp ,"<a onfocusload name='go' href='%s' %s></a>", url, mode==MEDIA_PLAY?"vod":"");
+         fprintf (fp ,"<a href='http://127.0.0.1:8883/start.cgi?list' tvid='home'></a>");
+         fprintf (fp ,"<a href='http://127.0.0.1:8883/start.cgi?list' tvid='source'></a>");
+         fprintf (fp ,"<br><font size='6' color='#ffffff'><b>Press Return on your remote to go back to your previous location</b></font>\n");
+         fclose(fp);
+      }
+      if (fp) {
+         fp = fopen("/tmp/gaya_bc", "wb");
+      }
+      if (fp) {
+         fprintf (fp ,"/tmp/runme.html\n");
+         fclose(fp);
+         log_printf("Wrote to /tmp/gaya_bc\n");
+      }
+      if (!fp) {
+         log_printf("failed to open /tmp/runme.html\n");
+      }
+#endif
+      break;
+   }
+   return 0;
+}
+#endif
 
 static int set_media_mode_url(MEDIA_MODES_T mode, const char *url)
 {
@@ -527,7 +644,6 @@ static int read_from_client(int filedes)
    nbytes = http_read_header(filedes, buffer, MAX_HEADER, &body, &body_size);
    if (nbytes > 0) {
       buffer[nbytes] = '\0';
-      if (strstr(buffer, "/reverse")==0) {log_printf("[%s]\n", buffer);}
    } else {
       /* End-of-file. */
       assert(nbytes == 0);
@@ -548,6 +664,13 @@ static int read_from_client(int filedes)
          last_scrub = -1;
       }
    } else if (found = strstr(buffer,"/play"), found) {
+      int itunes = 0;
+      found = strstr(buffer, "User-Agent: ");
+      if (found) {
+         found += STRLEN("User-Agent: ");
+         if (strncmp(found, "iTunes", STRLEN("iTunes"))==0)
+            itunes=1;
+      }
       found = strstr(buffer, "Content-Location: ");
       if (found) {
          found += STRLEN("Content-Location: ");
@@ -558,9 +681,9 @@ static int read_from_client(int filedes)
       if (found && !media_supported(found)) found = 0;
       if (found) {
          fprintf (stderr, "Found content: %s\n", found);
-         UrlEncode(found, airplay_url, sizeof airplay_url);
+         UrlEncode(found, airplay_url, sizeof airplay_url, itunes);
          set_media_mode_url(MEDIA_PLAY, airplay_url);
-         if (last_scrub > 0) {
+         if (last_scrub > 30) { // don't bother seeking small distances
             set_media_mode_ex(MEDIA_SEEK, NULL, last_scrub, NULL, NULL);
             last_position = last_scrub;
             last_scrub = -1;
@@ -571,7 +694,14 @@ static int read_from_client(int filedes)
       if (!found) status = STATUS_NOT_IMPLEMENTED;
    } else if (found = strstr(buffer,"/scrub"), found) {
       int position = 0, seek_offset = -1, duration = 0;
-      found = strstr(found, "?position=");
+      int itunes = 0;
+      found = strstr(buffer, "User-Agent: ");
+      if (found) {
+         found += STRLEN("User-Agent: ");
+         if (strncmp(found, "iTunes", STRLEN("iTunes"))==0)
+            itunes=1;
+      }
+      found = strstr(buffer, "?position=");
       if (found) seek_offset = (int)(atof(found+STRLEN("?position="))+0.0f);
       if (seek_offset >= 0) {
          fprintf (stderr, "Found scrub call, position=%d\n", seek_offset);
@@ -591,17 +721,25 @@ static int read_from_client(int filedes)
             last_position = position;
          }
       }
+      if (itunes && last_scrub >= 0) {
+         set_media_mode_ex(MEDIA_SEEK, NULL, last_scrub, NULL, NULL);
+         last_position = last_scrub;
+         last_scrub = -1;
+      }
       if (duration) sprintf(content, "duration: %f"NL"position: %f", (double)duration, (double)position);
    } else if (found = strstr(buffer,"/stop"), found) {
+      fprintf (stderr, "Stop request\n");
       set_media_mode(MEDIA_STOP);
    } else if (found = strstr(buffer,"/photo"), found) {
       fprintf (stderr, "Found photo call retrieve content address\n");
       int s;
       if (body_size && body) {
          char *photo = malloc(body_size);
-         const int already_got = body-buffer;
+         const int header_size = body-buffer;
+         const int already_got = nbytes-header_size;
+         assert(already_got >= 0);
          assert(photo);
-         memcpy(photo, buffer, already_got);
+         memcpy(photo, body, already_got);
          s = socket_read(filedes, photo+already_got, body_size-already_got);
          assert(s==body_size-already_got);
          FILE *fp = fopen("/tmp/airplay_photo.jpg", "wb");
@@ -612,19 +750,20 @@ static int read_from_client(int filedes)
          free(photo);
          set_media_mode_url(MEDIA_PHOTO, "file:///tmp/airplay_photo.jpg");
       }
+   } else if (found = strstr(buffer,"/volume"), found) {
+      // ignore
    } else {
       fprintf (stderr, "Unhandled [%s]\n", buffer);
       status = STATUS_NOT_IMPLEMENTED;
    }
    if (status) http_response(filedes, status, http_status_string(status), content[0] ? content:NULL);
-fail:
+   fail:
    if (buffer) free(buffer);
    if (content) free(content);
    return status==STATUS_OK || status==STATUS_SWITCHING_PROTOCOLS ? 0:-status;
 }
 
-static struct proxy_s
-{
+static struct proxy_s {
    struct in_addr sin_addr;
    int port;
    char host[256];
@@ -632,6 +771,10 @@ static struct proxy_s
    char httpversion;
 } proxy;
 
+
+/* 
+   Should be able to use proxy to play Apple trailers. E.g.
+   http://192.168.4.12:8008/playback?arg0=start_vod&arg1=AirPlayVideo&arg2=http://127.0.0.1:7000/proxy%3Furl=http://trailers.apple.com/movies/wb/redridinghood/redridinghood-tlr1_h480p.mov%26useragent=Quicktime&arg3=show */
 
 /* 
 GET http://127.0.0.1:7000/proxy?url=http://code.google.com/p/airplay-nmt/downloads/detail?name=airplay-nmt-r4.zip HTTP/1.0
@@ -666,62 +809,82 @@ static int read_from_proxy(int filedes)
    }
    char *tok = buffer, *last_tok = buffer, *next_tok = NULL;
    char *d = response_out;
-   if (next_tok = strstr(last_tok, NL), next_tok) tok = last_tok, *next_tok = '\0', last_tok = next_tok + strlen(NL); else tok = NULL;
+   if (next_tok = strstr(last_tok, NL), next_tok) tok = last_tok, *next_tok = '\0', last_tok = next_tok + strlen(NL);
+   else tok = NULL;
    while (tok) {
-     if (strncasecmp(tok, "GET ", STRLEN("GET ")) == 0 || strncasecmp(tok, "HEAD ", STRLEN("HEAD ")) == 0 ) {
-        char *url;
-        if (found = strstr(tok,"/proxy?"), found) {
-           found += STRLEN("/proxy?");
-           if (p = strstr(found, " HTTP/1."), p) { proxy.httpversion = p[STRLEN(" HTTP/1.")]; *p='\0'; }
-           char *found_url = strstr(found, "url="), *found_useragent = strstr(found, "useragent=");
-	   if (found_url) {
-              found = found_url + STRLEN("url=");
-              proxy.port = 80;
-              if (p=strstr(found, "://"), p) found = p + STRLEN("://");
-              if (p=strstr(found, "/"), p) { url = p; }
-              if (p=strstr(found, "&"), p) { *p='\0'; }
-              if (p=strstr(found, "\r"), p) { *p='\0'; }
-              if (p=strstr(found, "\n"), p) { *p='\0'; }
-              if (p=strstr(found, ":"), p) { *p='\0'; proxy.port = atoi(p+1); }
-              if (url && found && url-found>0) strncpy(proxy.host, found, min(url-found, sizeof proxy.host)); proxy.host[(sizeof proxy.host)-1] = '\0';
-              struct hostent *he;
-              //printf("parsed [%s] to [%s]:%d (%d.%d.%d.%d)\n", buffer, found, proxy.port, (proxy.sin_addr.s_addr>>0)&0xff,(proxy.sin_addr.s_addr>>8)&0xff,(proxy.sin_addr.s_addr>>16)&0xff,(proxy.sin_addr.s_addr>>24)&0xff);
-              if ((he = gethostbyname(proxy.host)) == NULL) {
-                 log_printf("parsed [%s] (%d.%d.%d.%d:%d)\n", proxy.host, (proxy.sin_addr.s_addr>>0)&0xff,(proxy.sin_addr.s_addr>>8)&0xff,(proxy.sin_addr.s_addr>>16)&0xff,(proxy.sin_addr.s_addr>>24)&0xff, proxy.port);
-	         perror_abort("error resolving hostname");
-              }
-              memcpy(&proxy.sin_addr, he->h_addr_list[0], sizeof proxy.sin_addr);
-              log_printf("parsed [%s] (%d.%d.%d.%d:%d)\n", proxy.host, (proxy.sin_addr.s_addr>>0)&0xff,(proxy.sin_addr.s_addr>>8)&0xff,(proxy.sin_addr.s_addr>>16)&0xff,(proxy.sin_addr.s_addr>>24)&0xff, proxy.port);
-           }
-           if (found_useragent) {
-              found = found_useragent + STRLEN("useragent=");
-              if (p=strstr(found, "&"), p) { *p='\0'; }
-              if (p=strstr(found, "\r"), p) { *p='\0'; }
-              if (p=strstr(found, "\n"), p) { *p='\0'; }
-              strncpy(proxy.useragent, found, sizeof proxy.useragent);
-              proxy.useragent[(sizeof proxy.useragent)-1] = '\0';
-              log_printf("parsed useragent [%s]\n", proxy.useragent);
-           }
-        } else {
-           if (strncasecmp(tok, "GET ", STRLEN("GET ")) == 0)
-              url = tok + STRLEN("GET ");
-           else if (strncasecmp(tok, "HEAD ", STRLEN("HEAD ")) == 0)
-              url = tok + STRLEN("HEAD ");
-           else assert(0);
-        }
-        d += sprintf(d, "GET %s HTTP/1.%c"NL, url, proxy.httpversion ? proxy.httpversion:'0');
-     } else if (strncasecmp(tok, "Host:", STRLEN("Host:")) == 0) {
-        if (proxy.port == 80)
-           d += sprintf(d, "Host: %s"NL, proxy.host);
-        else
-           d += sprintf(d, "Host: %s:%d"NL, proxy.host, proxy.port);
-     } else if (strncasecmp(tok, "User-Agent:", STRLEN("User-Agent:")) == 0 && proxy.useragent[0]) {
-        d += sprintf(d, "User-Agent: %s"NL, proxy.useragent);
-     } else {
-        d += sprintf(d, "%s"NL, tok);
-        assert(d < response_out + MAX_HEADER);
-     }
-     if (next_tok = strstr(last_tok, NL), next_tok) tok = last_tok, *next_tok = '\0', last_tok = next_tok + strlen(NL); else tok = NULL;
+      if (strncasecmp(tok, "GET ", STRLEN("GET ")) == 0 || strncasecmp(tok, "HEAD ", STRLEN("HEAD ")) == 0 ) {
+         char *url;
+         if (found = strstr(tok,"/proxy?"), found) {
+            found += STRLEN("/proxy?");
+            if (p = strstr(found, " HTTP/1."), p) {
+               proxy.httpversion = p[STRLEN(" HTTP/1.")]; *p='\0';
+            }
+            char *found_url = strstr(found, "url="), *found_useragent = strstr(found, "useragent=");
+            if (found_url) {
+               found = found_url + STRLEN("url=");
+               proxy.port = 80;
+               if (p=strstr(found, "://"), p) found = p + STRLEN("://");
+               if (p=strstr(found, "/"), p) {
+                  url = p;
+               }
+               if (p=strstr(found, "&useragent"), p) {
+                  *p='\0';
+               }
+               if (p=strstr(found, "\r"), p) {
+                  *p='\0';
+               }
+               if (p=strstr(found, "\n"), p) {
+                  *p='\0';
+               }
+               if (p=strstr(found, ":"), p) {
+                  *p='\0'; proxy.port = atoi(p+1);
+               }
+               if (url && found && url-found>0) strncpy(proxy.host, found, min(url-found, sizeof proxy.host));proxy.host[(sizeof proxy.host)-1] = '\0';
+               struct hostent *he;
+               //printf("parsed [%s] to [%s]:%d (%d.%d.%d.%d)\n", buffer, found, proxy.port, (proxy.sin_addr.s_addr>>0)&0xff,(proxy.sin_addr.s_addr>>8)&0xff,(proxy.sin_addr.s_addr>>16)&0xff,(proxy.sin_addr.s_addr>>24)&0xff);
+               if ((he = gethostbyname(proxy.host)) == NULL) {
+                  log_printf("parsed [%s] (%d.%d.%d.%d:%d)\n", proxy.host, (proxy.sin_addr.s_addr>>0)&0xff,(proxy.sin_addr.s_addr>>8)&0xff,(proxy.sin_addr.s_addr>>16)&0xff,(proxy.sin_addr.s_addr>>24)&0xff, proxy.port);
+                  perror_abort("error resolving hostname");
+               }
+               memcpy(&proxy.sin_addr, he->h_addr_list[0], sizeof proxy.sin_addr);
+               log_printf("parsed [%s] (%d.%d.%d.%d:%d)\n", proxy.host, (proxy.sin_addr.s_addr>>0)&0xff,(proxy.sin_addr.s_addr>>8)&0xff,(proxy.sin_addr.s_addr>>16)&0xff,(proxy.sin_addr.s_addr>>24)&0xff, proxy.port);
+            }
+            if (found_useragent) {
+               found = found_useragent + STRLEN("useragent=");
+               if (p=strstr(found, "&url"), p) {
+                  *p='\0';
+               }
+               if (p=strstr(found, "\r"), p) {
+                  *p='\0';
+               }
+               if (p=strstr(found, "\n"), p) {
+                  *p='\0';
+               }
+               strncpy(proxy.useragent, found, sizeof proxy.useragent);
+               proxy.useragent[(sizeof proxy.useragent)-1] = '\0';
+               log_printf("parsed useragent [%s]\n", proxy.useragent);
+            }
+         } else {
+            if (strncasecmp(tok, "GET ", STRLEN("GET ")) == 0)
+               url = tok + STRLEN("GET ");
+            else if (strncasecmp(tok, "HEAD ", STRLEN("HEAD ")) == 0)
+               url = tok + STRLEN("HEAD ");
+            else assert(0);
+         }
+         d += sprintf(d, "GET %s HTTP/1.%c"NL, url, proxy.httpversion ? proxy.httpversion:'0');
+      } else if (strncasecmp(tok, "Host:", STRLEN("Host:")) == 0) {
+         if (proxy.port == 80)
+            d += sprintf(d, "Host: %s"NL, proxy.host);
+         else
+            d += sprintf(d, "Host: %s:%d"NL, proxy.host, proxy.port);
+      } else if (strncasecmp(tok, "User-Agent:", STRLEN("User-Agent:")) == 0 && proxy.useragent[0]) {
+         d += sprintf(d, "User-Agent: %s"NL, proxy.useragent);
+      } else {
+         d += sprintf(d, "%s"NL, tok);
+         assert(d < response_out + MAX_HEADER);
+      }
+      if (next_tok = strstr(last_tok, NL), next_tok) tok = last_tok, *next_tok = '\0', last_tok = next_tok + strlen(NL);
+      else tok = NULL;
    }
 /* 855
 wget         proxy            google
@@ -748,19 +911,23 @@ OK<
    const int header_length = body-buffer;
    int remaining = header_length + body_size - nbytes;
    while (remaining) {
-     int nbytes = socket_read(sockfd, buffer, min(remaining, MAX_HEADER));
-     assert(nbytes >= 0);
-     if (nbytes > 0) {
-        s = socket_write(filedes, buffer, nbytes);
-        assert(s == nbytes);
-        remaining -= nbytes;
-     }
-   //fprintf(stderr, "%d/%d\n", nbytes, remaining);
+      int nbytes = socket_read(sockfd, buffer, min(remaining, MAX_HEADER));
+      assert(nbytes >= 0);
+      if (nbytes > 0) {
+         s = socket_write(filedes, buffer, nbytes);
+         if (s != nbytes) {
+            error_printf("read_from_proxy(%d) sent %d/%d (%d remaining)\n", filedes, s, nbytes, remaining);
+            remaining = 0;
+            break;
+         }
+         remaining -= nbytes;
+      }
+      //fprintf(stderr, "%d/%d\n", nbytes, remaining);
    }
    assert(remaining == 0);
    close(sockfd);
    status = 1;
-fail:
+   fail:
    if (buffer) free(buffer);
    if (response_out) free(response_out);
    return status==STATUS_OK || status==STATUS_SWITCHING_PROTOCOLS ? 0:-status;
@@ -814,7 +981,8 @@ static void *proxy_thread(void *arg)
 int main (int argc, char *argv[])
 {
    (void) signal(SIGINT, ex_program);
-   //(void) signal ( SIGSEGV ,ex_program);
+   (void) signal (SIGSEGV ,ex_program);
+   (void) signal (SIGPIPE, ignore_signal);
    int i, s;
    int sock;
    fd_set active_fd_set, read_fd_set;
@@ -822,8 +990,8 @@ int main (int argc, char *argv[])
 
    if (argc > 1 && argv[1][0] == '-' && argv[1][1] == 'v') loglevel = 2;
 
-   s = pthread_create( &proxy_threadt, NULL, proxy_thread, NULL);
-   assert(s==0);
+   //s = pthread_create( &proxy_threadt, NULL, proxy_thread, NULL);
+   //assert(s==0);
 
    /* Create the socket and set it up to accept connections. */
    sock = make_socket_in(PORT);
@@ -853,7 +1021,7 @@ int main (int argc, char *argv[])
                FD_SET(new_sock, &active_fd_set);
             } else {
                /* Data arriving on an already-connected socket. */
-               //fprintf (stderr, "%i) Server: connect from existing socket\n", i);
+               log_printf("%i) Server: connect from existing socket\n", i);
                if (read_from_client(i) < 0) {
                   //fprintf(stderr, "%i) Server: connect from existing socket closed\n", i);
                   close(i);
