@@ -333,6 +333,39 @@ typedef enum {
 } MEDIA_MODES_T;
 static const char *modename[] = {"MEDIA_STOP", "MEDIA_PLAY", "MEDIA_PAUSE", "MEDIA_RESUME", "MEDIA_SEEK", "MEDIA_PHOTO"};
 #define countof(x) (sizeof x/sizeof *(x))
+
+#ifdef A100
+static int get_media_info(int *position, int *duration, int *playing, int *paused, int *stopped, int *buffering, int *seekable)
+{
+   if (position) *position =0;
+   if (duration) *duration =0;
+   if (playing)  *playing  =1;
+   if (paused)   *paused   =0;
+   if (stopped)  *stopped  =0;
+   if (buffering)*buffering=0;
+   if (seekable) *seekable =0;
+   return 1;
+}
+static int get_photo_info(int *position, int *duration, int *playing, int *paused, int *stopped, int *buffering, int *seekable)
+{
+   if (position) *position =0;
+   if (duration) *duration =0;
+   if (playing)  *playing  =1;
+   if (paused)   *paused   =0;
+   if (stopped)  *stopped  =0;
+   if (buffering)*buffering=0;
+   if (seekable) *seekable =0;
+   return 1;
+}
+
+static int get_system_mode(int *browser, int *pod_playback, int *vod_playback)
+{
+   if (browser) *browser=1;
+   if (pod_playback) *pod_playback=0;
+   if (vod_playback) *vod_playback=0;
+   return 1;
+}
+#else
 static int get_media_info(int *position, int *duration, int *playing, int *paused, int *stopped, int *buffering, int *seekable)
 {
    const char *keys[] = {"?<returnValue>0", "<currentTime>", "<totalTime>", "?<currentStatus>play", "?<currentStatus>pause", "?<currentStatus>stop", "?<currentStatus>buffering", "?<seekEnable>true", NULL};
@@ -372,6 +405,7 @@ static int get_system_mode(int *browser, int *pod_playback, int *vod_playback)
    if (vod_playback) *vod_playback=values[3];
    return !values[0];
 }
+#endif
 #ifdef A100
 static void send_ir_key(char *str)
 {
@@ -542,11 +576,17 @@ static int set_media_mode_ex(MEDIA_MODES_T mode, const char *url, int seek_offse
    switch (mode) {
    default: break;
    case MEDIA_STOP:
-      send_ir_key("212");
+      send_ir_key("27");
+      break;
+   case MEDIA_PAUSE:
+      send_ir_key("234");
+      break;
+   case MEDIA_RESUME:
+      send_ir_key("233");
       break;
    case MEDIA_PLAY:
    case MEDIA_PHOTO:
-#if 1
+#if 0
       sprintf(cmd,"/bin/mono -single %s -dram 1\n", url);
       system(cmd);
 #else
@@ -563,7 +603,7 @@ static int set_media_mode_ex(MEDIA_MODES_T mode, const char *url, int seek_offse
          fp = fopen("/tmp/gaya_bc", "wb");
       }
       if (fp) {
-         fprintf (fp ,"/tmp/runme.html\n");
+         fprintf (fp, "/tmp/runme.html");
          fclose(fp);
          log_printf("Wrote to /tmp/gaya_bc\n");
       }
@@ -664,7 +704,11 @@ static int read_from_client(int filedes)
          last_scrub = -1;
       }
    } else if (found = strstr(buffer,"/play"), found) {
+#ifdef A100
+      int itunes = 1;
+#else
       int itunes = 0;
+#endif
       found = strstr(buffer, "User-Agent: ");
       if (found) {
          found += STRLEN("User-Agent: ");
@@ -990,8 +1034,8 @@ int main (int argc, char *argv[])
 
    if (argc > 1 && argv[1][0] == '-' && argv[1][1] == 'v') loglevel = 2;
 
-   //s = pthread_create( &proxy_threadt, NULL, proxy_thread, NULL);
-   //assert(s==0);
+   s = pthread_create( &proxy_threadt, NULL, proxy_thread, NULL);
+   assert(s==0);
 
    /* Create the socket and set it up to accept connections. */
    sock = make_socket_in(PORT);
