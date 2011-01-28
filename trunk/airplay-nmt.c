@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdarg.h>
 #include <assert.h>
 #include <ctype.h>
 #include <time.h>
@@ -24,6 +25,47 @@
 #define max(a,b) ((a)>(b)?(a):(b))
 #define min(a,b) ((a)<(b)?(a):(b))
 
+enum {
+#ifdef A100
+SourceButton= 0xDD,
+UpButton=     0xA8,
+HomeButton=   0xD0,
+LeftButton=   0xAA,
+OkButton=     0x0D,
+RightButton=  0xAB,
+InfoButton=   0x95,
+DownButton=   0xA9,
+BackButton=   0x8D,
+PlayButton=   0xE9,
+PauseButton=  0xEA,
+StopButton=   0x1B,
+Number0Button=0xF1,
+TimeSeek=     0x91,
+PowerButton=  0xD2,
+EjectButton=  0xEF,
+#else
+SourceButton= 'B',
+UpButton=     'U',
+HomeButton=   'O',
+LeftButton=   'L',
+OkButton=     '\n',
+RightButton=  'R',
+InfoButton=   'i',
+DownButton=   'D',
+BackButton=   'v',
+PlayButton=   'y',
+PauseButton=  'p',
+StopButton=   's',
+Number0Button='0',
+TimeSeek=     'H',
+PowerButton=  'x',
+EjectButton=  'j',
+#endif
+};
+typedef unsigned char REMOTE_BUTTONS;
+
+static int last_scrub=0, last_position=0, last_duration = 0;
+
 static struct sockaddr_in clientname, clientname_proxy; // hack: make global
 
 enum {
@@ -34,10 +76,40 @@ static char airplay_url[MAX_SEND];
 
 static int loglevel=1;
 
-#define log_printf if (loglevel<2) {} else printf
-#define error_printf if (loglevel<1) {} else printf
+#define log_printf(...) if (loglevel<2) {} else stamped_printf(stdout, __VA_ARGS__)
+#define error_printf(...) if (loglevel<1) {} else stamped_printf(stderr, __VA_ARGS__)
 #define STRLEN(s) (sizeof(s)-1)
 #define perror_abort(s) do {perror(s); exit(EXIT_FAILURE);}while(0)
+
+
+typedef enum {CLOCK_READ, CLOCK_RESET, CLOCK_PAUSE, CLOCK_RESUME} CLOCK_MODE_T;
+static unsigned get_seconds(CLOCK_MODE_T clock_mode)
+{
+   static time_t start;
+   static time_t now;
+   static int paused;
+   if (clock_mode == CLOCK_RESET) start = time(NULL);
+   else if (clock_mode == CLOCK_PAUSE) paused = 1;
+   else if (clock_mode == CLOCK_RESUME) paused = 0;
+   if (!paused) now = time(NULL);
+   return now-start;
+}
+
+
+static int stamped_printf(FILE *fp, const char *format, ...)
+{
+   va_list arg;
+   int done;
+   const time_t ltime=time(NULL); /* get current cal time */
+   char buf[32];
+   done = strftime(buf, sizeof buf, "%H:%M:%S", localtime(&ltime));
+   done = fprintf(fp, "%s:", buf);
+   va_start(arg, format);
+   done += vfprintf(fp, format, arg);
+   va_end(arg);
+   return done;
+}
+
 
 static char *UrlEncode(char *szText, char* szDst, int bufsize, int want_proxy)
 {
@@ -97,7 +169,7 @@ static int http_read_header(int sockfd, char *response, int response_size, char 
    while (1) {
       int nbytes = read(sockfd, response+bytes_read, response_size-bytes_read);
       //error_printf("% 6d: [%.*s]\n", nbytes, nbytes < 0 ? 0:nbytes, response+bytes_read);
-      //printf("http_read_header: read=%d, %d/%d\n", nbytes, bytes_read, response_size);
+      //log_printf("http_read_header: read=%d, %d/%d\n", nbytes, bytes_read, response_size);
       if (nbytes < 0) {
          /* Read error. */
          //perror_abort("http_read_header");
@@ -127,28 +199,30 @@ static int http_read_header(int sockfd, char *response, int response_size, char 
 
 static int socket_read(int sockfd, char *buffer, int length)
 {
-   int bytes_read=0;
+   int bytes_read=0, nbytes = 0;
    int remaining = length;
-   if (buffer) while (1) {
-         int nbytes = read(sockfd, buffer+bytes_read, remaining);
-         //error_printf("% 6d: [%.*s]\n", nbytes, nbytes < 0 ? 0:nbytes, response+bytes_read);
-         if (nbytes < 0) {
-            /* Read error. */
-            //perror_abort("socket_read");
-            break;
-         } else if (nbytes == 0) {
-            /* End-of-file. */
-            break;
-         } else {
-            /* Data read. */
-            bytes_read += nbytes;
-            remaining -= nbytes;
-            assert(bytes_read <= length);
-         }
+   assert(buffer);
+   while (1) {
+      nbytes = read(sockfd, buffer+bytes_read, remaining);
+      //error_printf("% 6d: [%.*s]\n", nbytes, nbytes > 0 ? 0:nbytes, buffer+bytes_read);
+      //log_printf("% 6d %d\n", nbytes, remaining);
+      if (nbytes < 0) {
+         /* Read error. */
+         //perror_abort("socket_read");
+         break;
+      } else if (nbytes == 0) {
+         /* End-of-file. */
+         break;
+      } else {
+         /* Data read. */
+         bytes_read += nbytes;
+         remaining -= nbytes;
+         assert(bytes_read <= length);
       }
+   }
    if (bytes_read < 4096) log_printf("socket_read(%d): DONE %d/%d (%d)\n[%.*s]\n", sockfd, bytes_read, length, remaining, bytes_read, buffer);
    else log_printf("socket_read(%d): DONE %d/%d (%d)\n", sockfd, bytes_read, length, remaining);
-   return bytes_read;
+   return bytes_read > 0 ? bytes_read : nbytes;
 }
 
 static int socket_write(int sockfd, const char *buffer, int length)
@@ -344,26 +418,8 @@ static int get_media_info(int *position, int *duration, int *playing, int *pause
    if (stopped)  *stopped  =0;
    if (buffering)*buffering=0;
    if (seekable) *seekable =0;
-   return 1;
-}
-static int get_photo_info(int *position, int *duration, int *playing, int *paused, int *stopped, int *buffering, int *seekable)
-{
-   if (position) *position =0;
-   if (duration) *duration =0;
-   if (playing)  *playing  =1;
-   if (paused)   *paused   =0;
-   if (stopped)  *stopped  =0;
-   if (buffering)*buffering=0;
-   if (seekable) *seekable =0;
-   return 1;
-}
-
-static int get_system_mode(int *browser, int *pod_playback, int *vod_playback)
-{
-   if (browser) *browser=1;
-   if (pod_playback) *pod_playback=0;
-   if (vod_playback) *vod_playback=0;
-   return 1;
+   if (position) *position = last_position + get_seconds(CLOCK_READ);
+   return 0;
 }
 #else
 static int get_media_info(int *position, int *duration, int *playing, int *paused, int *stopped, int *buffering, int *seekable)
@@ -407,17 +463,20 @@ static int get_system_mode(int *browser, int *pod_playback, int *vod_playback)
 }
 #endif
 #ifdef A100
-static void send_ir_key(char *str)
+static void send_ir_keys(REMOTE_BUTTONS *code, int num)
 {
-   FILE *fp = fopen("/tmp/ir_key", "wb");
+   FILE *fp = fopen("/tmp/irkey", "wb");
    if (fp) {
-      fprintf (fp ,"%s\n", str);
+      int i;
+      for (i=0; i<num; i++) {
+         fprintf (fp ,"%d\n", code[i]);
+         log_printf("Wrote %d to /tmp/ir_key\n", code[i]);
+      }
       fclose(fp);
-      log_printf("Wrote %s to /tmp/ir_key\n", str);
    } else assert(0);
 }
 #else
-static void send_ir_key(char *str)
+static void send_ir_keys(REMOTE_BUTTONS *code, int num)
 {
    int s, sockfd;
    struct in_addr sin_addr;
@@ -429,13 +488,17 @@ static void send_ir_key(char *str)
 
    sockfd = make_socket_out(sin_addr, 30000);
    if (sockfd > 0) {
-      s = socket_write(sockfd, str, strlen(str));
-      assert(s == strlen(str));
+      s = socket_write(sockfd, (char *)code, num);
+      assert(s == num);
       close(sockfd);
    } else assert(0);
 }
 #endif
-
+static void send_ir_key(REMOTE_BUTTONS code)
+{
+   send_ir_keys(&code, 1);
+}
+#ifndef A100
 static int wait_media_ready(MEDIA_MODES_T mode, MEDIA_MODES_T last_mode, int seek_offset, int *position, int *duration)
 {
    int seekable = 0, playing = 0, paused=0, stopped=0, buffering=0;
@@ -490,9 +553,132 @@ static int wait_media_ready(MEDIA_MODES_T mode, MEDIA_MODES_T last_mode, int see
               seekable, playing, paused, stopped, buffering, 0, media_status );
    return media_status;
 }
+#endif
 
-static int last_scrub=0, last_position=0, last_duration = 0;
-#ifndef A100
+#ifdef A100
+static void set_bookmark(const char *url, int time)
+{
+   char buf[MAX_SEND];
+   FILE *fpin = fopen("/tmp/mono_bookmark", "rt");
+   FILE *fpout = fopen("/tmp/tmp_bookmark", "wt");
+   int found=0;
+   if (fpin && fpout) while (!feof(fpin)) {
+      if (fgets(buf, sizeof buf, fpin) == 0) break;
+      if (strstr(buf, url)) {
+         fprintf(fpout, "bookmark_time=%d toadj=0 bookmark_filename=%s\n", time, url);
+         found = 1;
+      } else {
+         fprintf(fpout, "%s", buf);
+      }
+   }
+   if (fpout && !found)
+      fprintf(fpout, "bookmark_time=%d toadj=0 bookmark_filename=%s\n", time, url);
+   if (fpin) fclose(fpin);
+   if (fpout) fclose(fpout);
+   system("cp /tmp/tmp_bookmark /tmp/mono_bookmark");
+}
+#endif
+
+#ifdef A100
+static int set_media_mode_ex(MEDIA_MODES_T mode, const char *url, int seek_offset, int *position, int *duration)
+{
+   int s, media_status=0;
+   FILE *fp;
+   char cmd[MAX_SEND];
+   static MEDIA_MODES_T last_mode;
+   int dummy_position=0, dummy_duration=0;
+
+   if (!position) position=&dummy_position;
+   if (!duration) duration=&dummy_duration;
+
+   log_printf("### set_media_mode_ex(%s,%d)\n", modename[mode], seek_offset);
+   if (last_mode == MEDIA_STOP && mode != MEDIA_STOP && mode != MEDIA_PLAY && mode != MEDIA_PHOTO && airplay_url[0])
+      set_media_mode_ex(MEDIA_PLAY, airplay_url, seek_offset, position, duration);
+   switch (mode) {
+   default: break;
+   case MEDIA_STOP:
+      if (last_mode != MEDIA_PHOTO) {send_ir_key(StopButton); usleep(3000000);}
+      send_ir_key(BackButton);
+      break;
+   case MEDIA_PAUSE:
+      send_ir_key(PauseButton);
+      get_seconds(CLOCK_PAUSE);
+      break;
+   case MEDIA_RESUME:
+      send_ir_key(PlayButton);
+      get_seconds(CLOCK_RESUME);
+      break;
+   case MEDIA_SEEK:
+   {
+      const int hours = seek_offset / (60*60);
+      const int minutes = (seek_offset % (60*60)) / 60;
+      const int seconds = (seek_offset % (60*60)) % 60;
+      REMOTE_BUTTONS keys[11], *k=keys;
+      log_printf("seek_offset=%d (%02d:%02d:%02d)\n", seek_offset, hours, minutes, seconds);
+      if (seek_offset <= 30) {
+         send_ir_key(Number0Button);
+         break;
+      }
+      *k++ = TimeSeek;
+#ifdef A100
+      *k++ = Number0Button+((hours/10)%10);
+      *k++ = Number0Button+((hours)%10);
+      *k++ = Number0Button+((minutes/10)%10);
+      *k++ = Number0Button+((minutes)%10);
+      *k++ = Number0Button+((seconds/10)%10);
+      *k++ = Number0Button+((seconds)%10);
+#else
+      *k++ = LeftButton;
+      *k++ = Number0Button+((hours/10)%10);
+      *k++ = Number0Button+((hours)%10);
+      *k++ = RightButton;
+      *k++ = Number0Button+((minutes/10)%10);
+      *k++ = Number0Button+((minutes)%10);
+      *k++ = RightButton;
+      *k++ = Number0Button+((seconds/10)%10);
+      *k++ = Number0Button+((seconds)%10);
+      *k++ = OkButton;
+#endif
+      send_ir_keys(keys, k-keys);
+      break;
+   }
+   case MEDIA_PLAY:
+   case MEDIA_PHOTO:
+      get_seconds(CLOCK_RESET);
+      fp = fopen("/tmp/runme.html", "wb");
+      if (fp) {
+         if (mode==MEDIA_PHOTO) {
+            fprintf (fp ,"<body bgcolor=black link=black>");
+            fprintf (fp ,"<center><img src=\"%s\" height=\"%d\"></center>", url, 680);
+            fprintf (fp ,"<a href='http://127.0.0.1:8883/start.cgi?list' tvid='home'></a>");
+            fprintf (fp ,"<a href='http://127.0.0.1:8883/start.cgi?list' tvid='source'></a>");
+            //fprintf (fp ,"<br><font size='6' color='#ffffff'><b>Press Return on your remote to go back to your previous location</b></font>\n");
+         } else {
+            fprintf (fp ,"<body bgcolor=black link=black onloadset='go'>");
+            fprintf (fp ,"<a onfocusload name='go' href='%s' %s></a>", url, mode==MEDIA_PLAY?"vod":"");
+            fprintf (fp ,"<a href='http://127.0.0.1:8883/start.cgi?list' tvid='home'></a>");
+            fprintf (fp ,"<a href='http://127.0.0.1:8883/start.cgi?list' tvid='source'></a>");
+            fprintf (fp ,"<br><font size='6' color='#ffffff'><b>Press Return on your remote to go back to your previous location</b></font>\n");
+         }
+         fclose(fp);
+      }
+      if (fp) {
+         fp = fopen("/tmp/gaya_bc", "wb");
+      }
+      if (fp) {
+         fprintf (fp, "/tmp/runme.html");
+         fclose(fp);
+         log_printf("Wrote to /tmp/gaya_bc\n");
+      }
+      if (!fp) {
+         log_printf("failed to open /tmp/runme.html\n");
+      }
+      break;
+   }
+   last_mode = media_status==0 ? mode : MEDIA_STOP;
+   return 0;
+}
+#else
 static int set_media_mode_ex(MEDIA_MODES_T mode, const char *url, int seek_offset, int *position, int *duration)
 {
    char cmd[MAX_SEND];
@@ -528,9 +714,12 @@ static int set_media_mode_ex(MEDIA_MODES_T mode, const char *url, int seek_offse
       sprintf(cmd, "http://127.0.0.1:8008/playback?arg0=set_time_seek_vod&arg1=%02d:%02d:%02d", seek_offset / 3600, (seek_offset / 60)%60, seek_offset % 60);
       break;
    case MEDIA_PAUSE:
+      send_ir_key(PauseButton); send_command=0; break;
       sprintf(cmd, "http://127.0.0.1:8008/playback?arg0=pause_vod");
       break;
    case MEDIA_RESUME:
+      if (last_mode==MEDIA_RESUME) return 0;
+      send_ir_key(PlayButton); send_command=0; break;
       sprintf(cmd, "http://127.0.0.1:8008/playback?arg0=resume_vod");
       break;
    }
@@ -546,7 +735,7 @@ static int set_media_mode_ex(MEDIA_MODES_T mode, const char *url, int seek_offse
       assert(s==0);
       if (!pod_playback) {
          usleep(100000);
-         send_ir_key("B\n");
+         send_ir_key(SourceButton); send_ir_key(OkButton);
          //http_request("http://127.0.0.1:8008/system?arg0=send_key&arg2=source&arg3=browser");
          //usleep(100000);
          //http_request("http://127.0.0.1:8008/system?arg0=send_key&arg2=enter");
@@ -557,7 +746,7 @@ static int set_media_mode_ex(MEDIA_MODES_T mode, const char *url, int seek_offse
       assert(s==0);
       if (!browser) {
          usleep(100000);
-         send_ir_key("xx");
+         send_ir_key(PowerButton); send_ir_key(PowerButton);
       }
    }
    if (mode==MEDIA_STOP) {
@@ -565,55 +754,6 @@ static int set_media_mode_ex(MEDIA_MODES_T mode, const char *url, int seek_offse
    }
    last_mode = media_status==0 ? mode : MEDIA_STOP;
    return media_status;
-}
-#else
-static int set_media_mode_ex(MEDIA_MODES_T mode, const char *url, int seek_offset, int *position, int *duration)
-{
-   int s;
-   FILE *fp;
-   char cmd[MAX_SEND];
-   log_printf("### set_media_mode_ex(%s,%d)\n", modename[mode], seek_offset);
-   switch (mode) {
-   default: break;
-   case MEDIA_STOP:
-      send_ir_key("27");
-      break;
-   case MEDIA_PAUSE:
-      send_ir_key("234");
-      break;
-   case MEDIA_RESUME:
-      send_ir_key("233");
-      break;
-   case MEDIA_PLAY:
-   case MEDIA_PHOTO:
-#if 0
-      sprintf(cmd,"/bin/mono -single %s -dram 1\n", url);
-      system(cmd);
-#else
-      fp = fopen("/tmp/runme.html", "wb");
-      if (fp) {
-         fprintf (fp ,"<body bgcolor=black link=black onloadset='go'>");
-         fprintf (fp ,"<a onfocusload name='go' href='%s' %s></a>", url, mode==MEDIA_PLAY?"vod":"");
-         fprintf (fp ,"<a href='http://127.0.0.1:8883/start.cgi?list' tvid='home'></a>");
-         fprintf (fp ,"<a href='http://127.0.0.1:8883/start.cgi?list' tvid='source'></a>");
-         fprintf (fp ,"<br><font size='6' color='#ffffff'><b>Press Return on your remote to go back to your previous location</b></font>\n");
-         fclose(fp);
-      }
-      if (fp) {
-         fp = fopen("/tmp/gaya_bc", "wb");
-      }
-      if (fp) {
-         fprintf (fp, "/tmp/runme.html");
-         fclose(fp);
-         log_printf("Wrote to /tmp/gaya_bc\n");
-      }
-      if (!fp) {
-         log_printf("failed to open /tmp/runme.html\n");
-      }
-#endif
-      break;
-   }
-   return 0;
 }
 #endif
 
@@ -639,11 +779,13 @@ static int make_socket_in(uint16_t port)
       perror_abort("socket");
    }
    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse_addr, sizeof(reuse_addr));
+   setsockopt(sock, SOL_SOCKET, SO_LINGER, &reuse_addr, sizeof(reuse_addr));
+   setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &reuse_addr, sizeof(reuse_addr));
 
    /* Give the socket a name. */
    memset((char *) &name, 0, sizeof name);
    name.sin_family = AF_INET;
-   name.sin_port = htons (port);
+   name.sin_port = htons(port);
    name.sin_addr.s_addr = htonl (INADDR_ANY);
    if (bind(sock, (struct sockaddr *) &name, sizeof name) < 0) {
       perror_abort("bind");
@@ -705,15 +847,15 @@ static int read_from_client(int filedes)
       }
    } else if (found = strstr(buffer,"/play"), found) {
 #ifdef A100
-      int itunes = 1;
+      int proxy = 1;
 #else
-      int itunes = 0;
+      int proxy = 0;
 #endif
       found = strstr(buffer, "User-Agent: ");
       if (found) {
          found += STRLEN("User-Agent: ");
          if (strncmp(found, "iTunes", STRLEN("iTunes"))==0)
-            itunes=1;
+            proxy=1;
       }
       found = strstr(buffer, "Content-Location: ");
       if (found) {
@@ -725,13 +867,20 @@ static int read_from_client(int filedes)
       if (found && !media_supported(found)) found = 0;
       if (found) {
          fprintf (stderr, "Found content: %s\n", found);
-         UrlEncode(found, airplay_url, sizeof airplay_url, itunes);
+         UrlEncode(found, airplay_url, sizeof airplay_url, proxy);
+#ifdef A100
+         set_bookmark(airplay_url, last_scrub);
          set_media_mode_url(MEDIA_PLAY, airplay_url);
-         if (last_scrub > 30) { // don't bother seeking small distances
+            last_position = last_scrub;
+            last_scrub = -1;
+
+#else
+         if (last_scrub >= 0) {
             set_media_mode_ex(MEDIA_SEEK, NULL, last_scrub, NULL, NULL);
             last_position = last_scrub;
             last_scrub = -1;
          }
+#endif
       } else {
          fprintf (stderr, "Content not found: [%s]\n", buffer);
       }
@@ -750,7 +899,6 @@ static int read_from_client(int filedes)
       if (seek_offset >= 0) {
          fprintf (stderr, "Found scrub call, position=%d\n", seek_offset);
       }
-      //set_media_mode_ex(MEDIA_SEEK, NULL, seek_offset, &position, &duration );
       if (seek_offset >= 0) {
          last_scrub = last_position = position = seek_offset;
          duration = 0;//last_duration;
@@ -761,8 +909,10 @@ static int read_from_client(int filedes)
             position = last_position;
             duration = last_duration;
          } else {
+            #ifndef A100
             last_duration = duration;
             last_position = position;
+            #endif
          }
       }
       if (itunes && last_scrub >= 0) {
@@ -796,6 +946,8 @@ static int read_from_client(int filedes)
       }
    } else if (found = strstr(buffer,"/volume"), found) {
       // ignore
+   } else if (found = strstr(buffer,"/server-info"), found) {
+      // what to do here?
    } else {
       fprintf (stderr, "Unhandled [%s]\n", buffer);
       status = STATUS_NOT_IMPLEMENTED;
@@ -956,8 +1108,8 @@ OK<
    int remaining = header_length + body_size - nbytes;
    while (remaining) {
       int nbytes = socket_read(sockfd, buffer, min(remaining, MAX_HEADER));
-      assert(nbytes >= 0);
-      if (nbytes > 0) {
+      if (nbytes < 0) goto err_closed;
+      else if (nbytes > 0) {
          s = socket_write(filedes, buffer, nbytes);
          if (s != nbytes) {
             error_printf("read_from_proxy(%d) sent %d/%d (%d remaining)\n", filedes, s, nbytes, remaining);
@@ -969,6 +1121,7 @@ OK<
       //fprintf(stderr, "%d/%d\n", nbytes, remaining);
    }
    assert(remaining == 0);
+err_closed:
    close(sockfd);
    status = 1;
    fail:
@@ -1013,7 +1166,9 @@ static void *proxy_thread(void *arg)
                //fprintf (stderr, "%i) Server: connect from existing socket\n", i);
                if (read_from_proxy(i) < 0) {
                   //fprintf (stderr, "%i) Server: connect from existing socket closed\n", i);
-                  close(i);
+                  if (s = close(i), s != 0) {
+                     perror_abort("socket close");
+                  }
                   FD_CLR(i, &active_fd_set);
                }
             }
