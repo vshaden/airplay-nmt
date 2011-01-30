@@ -25,6 +25,12 @@
 #define max(a,b) ((a)>(b)?(a):(b))
 #define min(a,b) ((a)<(b)?(a):(b))
 
+#ifdef A100
+static const int a100=1;
+#else
+static const int a100=0;
+#endif
+
 enum {
 #ifdef A100
 SourceButton= 0xDD,
@@ -111,7 +117,7 @@ static int stamped_printf(FILE *fp, const char *format, ...)
 }
 
 
-static char *UrlEncode(char *szText, char* szDst, int bufsize, int want_proxy)
+static char *UrlMangle(const char *szText, char *szDst, int bufsize, int want_proxy)
 {
    char ch; 
    char szHex[5];
@@ -131,7 +137,25 @@ static char *UrlEncode(char *szText, char* szDst, int bufsize, int want_proxy)
          strcpy(szDst+j, inet_ntoa(clientname.sin_addr));
          j += strlen(inet_ntoa(clientname.sin_addr));
          i += STRLEN("://0.0.0.0")-1;
-      } else if (isalnum(ch) || ch=='/' || ch==':' || ch=='.' || ch=='_' || ch=='-')
+      } else {
+         szDst[j++]=ch;
+      }
+   }
+   szDst[j]='\0';
+   return szDst;
+}
+
+static char *UrlEncode(const char *szText, char *szDst, int bufsize)
+{
+   char ch; 
+   char szHex[5];
+   int iMax,i,j; 
+
+   iMax = bufsize-2;
+   szDst[0]='\0';
+   for (i = 0,j=0; szText[i] && j <= iMax; i++) {
+      ch = szText[i];
+      if (isalnum(ch) || ch=='/' || ch==':' || ch=='.' || ch=='_' || ch=='-' || ch=='~')
          szDst[j++]=ch;
       else if (ch == ' ')
          szDst[j++]='+';
@@ -145,6 +169,34 @@ static char *UrlEncode(char *szText, char* szDst, int bufsize, int want_proxy)
    }
    szDst[j]='\0';
    return szDst;
+}
+
+static int ishex(char s)
+{
+   int ret;
+   const char *hex = "0123456789abcdef";
+   ret = strchr(hex, tolower(s)) - hex;
+   return (ret >=0 && ret <16);
+}
+
+static int dehex(char s)
+{
+   int ret;
+   const char *hex = "0123456789abcdef";
+   ret = strchr(hex, tolower(s)) - hex;
+   assert(ret >=0 && ret <16);
+   return ret;
+}
+
+static void UrlDecode(const char *src, char *dst)
+{
+   const char *s = src; char *d = dst;
+   while (*s) {
+      if (s[0]=='%' && ishex(s[1]) && ishex(s[2]))
+         *d++ = (dehex(s[1])<<4)|(dehex(s[2])<<0), s+=3;
+      else *d++ = *s++;
+   }
+   *d++ = '\0';
 }
 
 static char *strnstr(const char *s1, const char *s2, size_t n)
@@ -534,8 +586,16 @@ static int wait_media_ready(MEDIA_MODES_T mode, MEDIA_MODES_T last_mode, int see
          if (seekable && !buffering)
             break;
       } else if (mode == MEDIA_PLAY) {
-         if (playing && !buffering && seekable)
+         if (playing && !buffering && seekable && !paused)
             break;
+         if (0 && !buffering && paused && timeout>=900) {
+            error_printf("Stuck in paused - resuming: wait_media_ready(%s->%s, %d, %d, %d) failed (%d,%d,%d,%d,%d,%d,%d)\n", 
+                       modename[last_mode], modename[mode], seek_offset, *position, *duration,
+                       seekable, playing, paused, stopped, buffering, 0, media_status );
+            // for no good reason youtube videos end up in paused state here
+            int s = http_request("http://127.0.0.1:8008/playback?arg0=resume_vod");
+            assert(s==0);
+         }
       } else if (mode == MEDIA_PHOTO) {
          if (playing)
             break;
@@ -645,17 +705,18 @@ static int set_media_mode_ex(MEDIA_MODES_T mode, const char *url, int seek_offse
    case MEDIA_PLAY:
    case MEDIA_PHOTO:
       get_seconds(CLOCK_RESET);
+      UrlEncode(url, cmd, MAX_SEND-1);
       fp = fopen("/tmp/runme.html", "wb");
       if (fp) {
          if (mode==MEDIA_PHOTO) {
             fprintf (fp ,"<body bgcolor=black link=black>");
-            fprintf (fp ,"<center><img src=\"%s\" height=\"%d\"></center>", url, 680);
+            fprintf (fp ,"<center><img src=\"%s\" height=\"%d\"></center>", cmd, 680);
             fprintf (fp ,"<a href='http://127.0.0.1:8883/start.cgi?list' tvid='home'></a>");
             fprintf (fp ,"<a href='http://127.0.0.1:8883/start.cgi?list' tvid='source'></a>");
             //fprintf (fp ,"<br><font size='6' color='#ffffff'><b>Press Return on your remote to go back to your previous location</b></font>\n");
          } else {
             fprintf (fp ,"<body bgcolor=black link=black onloadset='go'>");
-            fprintf (fp ,"<a onfocusload name='go' href='%s' %s></a>", url, mode==MEDIA_PLAY?"vod":"");
+            fprintf (fp ,"<a onfocusload name='go' href='%s' %s></a>", cmd, mode==MEDIA_PLAY?"vod":"");
             fprintf (fp ,"<a href='http://127.0.0.1:8883/start.cgi?list' tvid='home'></a>");
             fprintf (fp ,"<a href='http://127.0.0.1:8883/start.cgi?list' tvid='source'></a>");
             fprintf (fp ,"<br><font size='6' color='#ffffff'><b>Press Return on your remote to go back to your previous location</b></font>\n");
@@ -701,12 +762,16 @@ static int set_media_mode_ex(MEDIA_MODES_T mode, const char *url, int seek_offse
          sprintf(cmd, "http://127.0.0.1:8008/playback?arg0=stop_vod");
       break;
    case MEDIA_PLAY:
-      sprintf(cmd, "http://127.0.0.1:8008/playback?arg0=start_vod&arg1=AirPlayVideo&arg2=%s&arg3=show&arg4=%d", url, 0);
+      strcpy(cmd, "http://127.0.0.1:8008/playback?arg0=start_vod&arg1=AirPlayVideo&arg2=");
+      UrlEncode(url, cmd+strlen(cmd), MAX_SEND - STRLEN("http://127.0.0.1:8008/playback?arg0=start_vod&arg1=AirPlayVideo&arg2=") - STRLEN("&arg3=show&arg4=0")-1);
+      strcat(cmd, "&arg3=show&arg4=0");
       //sprintf(cmd, "http://127.0.0.1:8080/xbmcCmds/xbmcHttp?command=PlayFile(%s)", url);
       break;
    case MEDIA_PHOTO:
       send_command = 1;
-      sprintf(cmd, "http://127.0.0.1:8008/playback?arg0=start_pod&arg1=AirPlayPhoto&arg2=%s&arg3=1&arg4=rot0&arg5=bghide", url);
+      strcpy(cmd, "http://127.0.0.1:8008/playback?arg0=start_pod&arg1=AirPlayPhoto&arg2=");
+      UrlEncode(url, cmd+strlen(cmd), MAX_SEND - STRLEN("http://127.0.0.1:8008/playback?arg0=start_pod&arg1=AirPlayPhoto&arg2=") - STRLEN("&arg3=1&arg4=rot0&arg5=bghide")-1);
+      strcat(cmd, "&arg3=1&arg4=rot0&arg5=bghide");
       break;
    case MEDIA_SEEK:
       assert(seek_offset >= 0);
@@ -846,11 +911,7 @@ static int read_from_client(int filedes)
          last_scrub = -1;
       }
    } else if (found = strstr(buffer,"/play"), found) {
-#ifdef A100
-      int proxy = 1;
-#else
-      int proxy = 0;
-#endif
+      int proxy = a100;
       found = strstr(buffer, "User-Agent: ");
       if (found) {
          found += STRLEN("User-Agent: ");
@@ -867,7 +928,7 @@ static int read_from_client(int filedes)
       if (found && !media_supported(found)) found = 0;
       if (found) {
          fprintf (stderr, "Found content: %s\n", found);
-         UrlEncode(found, airplay_url, sizeof airplay_url, proxy);
+         UrlMangle(found, airplay_url, sizeof airplay_url, proxy);
 #ifdef A100
          set_bookmark(airplay_url, last_scrub);
          set_media_mode_url(MEDIA_PLAY, airplay_url);
@@ -1010,6 +1071,7 @@ static int read_from_proxy(int filedes)
    while (tok) {
       if (strncasecmp(tok, "GET ", STRLEN("GET ")) == 0 || strncasecmp(tok, "HEAD ", STRLEN("HEAD ")) == 0 ) {
          char *url;
+         UrlDecode(tok, tok);
          if (found = strstr(tok,"/proxy?"), found) {
             found += STRLEN("/proxy?");
             if (p = strstr(found, " HTTP/1."), p) {
