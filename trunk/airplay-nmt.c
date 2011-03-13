@@ -15,6 +15,8 @@
 #include <signal.h>
 #include <pthread.h>
 
+#include "airplay-nmt.h"
+
 #define PORT      6000
 #define PROXYPORT 7000
 #define MAX_HEADER   5120
@@ -33,42 +35,46 @@ static const int a100=0;
 
 enum {
 #ifdef A100
-SourceButton= 0xDD,
-UpButton=     0xA8,
-HomeButton=   0xD0,
-LeftButton=   0xAA,
-OkButton=     0x0D,
-RightButton=  0xAB,
-InfoButton=   0x95,
-DownButton=   0xA9,
-BackButton=   0x8D,
-PlayButton=   0xE9,
-PauseButton=  0xEA,
-StopButton=   0x1B,
-Number0Button=0xF1,
-TimeSeek=     0x91,
-PowerButton=  0xD2,
-EjectButton=  0xEF,
+   SourceButton= 0xDD,
+   UpButton=     0xA8,
+   HomeButton=   0xD0,
+   LeftButton=   0xAA,
+   OkButton=     0x0D,
+   RightButton=  0xAB,
+   InfoButton=   0x95,
+   DownButton=   0xA9,
+   BackButton=   0x8D,
+   PlayButton=   0xE9,
+   PauseButton=  0xEA,
+   StopButton=   0x1B,
+   Number0Button=0xF1,
+   TimeSeek=     0x91,
+   PowerButton=  0xD2,
+   EjectButton=  0xEF,
 #else
-SourceButton= 'B',
-UpButton=     'U',
-HomeButton=   'O',
-LeftButton=   'L',
-OkButton=     '\n',
-RightButton=  'R',
-InfoButton=   'i',
-DownButton=   'D',
-BackButton=   'v',
-PlayButton=   'y',
-PauseButton=  'p',
-StopButton=   's',
-Number0Button='0',
-TimeSeek=     'H',
-PowerButton=  'x',
-EjectButton=  'j',
+   SourceButton= 'B',
+   UpButton=     'U',
+   HomeButton=   'O',
+   LeftButton=   'L',
+   OkButton=     '\n',
+   RightButton=  'R',
+   InfoButton=   'i',
+   DownButton=   'D',
+   BackButton=   'v',
+   PlayButton=   'y',
+   PauseButton=  'p',
+   StopButton=   's',
+   Number0Button='0',
+   TimeSeek=     'H',
+   PowerButton=  'x',
+   EjectButton=  'j',
 #endif
 };
 typedef unsigned char REMOTE_BUTTONS;
+
+#define HTML_REPORT_ERRROR2  "<body bgcolor=black link=black>" \
+                             "<font size='6' color='#ffffff'><b><br><br>%s<br>%s</b></font>" \
+                             "<br><font size='6' color='#ffffff'><b>Press Return on your remote to go back to your previous location</b></font>\n"
 
 static int last_scrub=0, last_position=0, last_duration = 0;
 
@@ -88,7 +94,9 @@ static int loglevel=1;
 #define perror_abort(s) do {perror(s); exit(EXIT_FAILURE);}while(0)
 
 
-typedef enum {CLOCK_READ, CLOCK_RESET, CLOCK_PAUSE, CLOCK_RESUME} CLOCK_MODE_T;
+typedef enum {
+   CLOCK_READ, CLOCK_RESET, CLOCK_PAUSE, CLOCK_RESUME
+} CLOCK_MODE_T;
 static unsigned get_seconds(CLOCK_MODE_T clock_mode)
 {
    static time_t start;
@@ -176,7 +184,7 @@ static int ishex(char s)
    int ret;
    const char *hex = "0123456789abcdef";
    ret = strchr(hex, tolower(s)) - hex;
-   return (ret >=0 && ret <16);
+   return(ret >=0 && ret <16);
 }
 
 static int dehex(char s)
@@ -307,13 +315,14 @@ static int socket_write(int sockfd, const char *buffer, int length)
    return bytes_written;
 }
 
-static void http_response(int sockfd, int status, const char *status_string, const char *content)
+static void http_response(int sockfd, int status, const char *status_string, const char *content, const char *header)
 {
    char response[MAX_RESPONSE];
    const time_t ltime=time(NULL); /* get current cal time */
    const char *date = asctime(gmtime(&ltime)); //"Fri, 17 Dec 2010 11:18:01 GMT"NL;
    if (content && content[0] == '*') content++, sprintf(response, "HTTP/1.1 %d %s"NL"Date: %s", status, status_string, date);
    else sprintf(response, "HTTP/1.1 %d %s"NL "Date: %s" "Content-Length:%d"NL, status, status_string, date, content ? strlen(content)+2:0);
+   if (header) strcat(response, header);
    if (content) strcat(response, ""NL), strcat(response, content);
    strcat(response, ""NL);
    //if (status != STATUS_SWITCHING_PROTOCOLS) {log_printf("{%s}\n", response);}
@@ -438,6 +447,184 @@ static int http_request_and_parse_nums(const char *command, const char *key[], i
    }
    return s;
 }
+
+typedef struct BPListTrailer {
+   uint8_t           unused[6];
+   uint8_t           offsetIntSize;
+   uint8_t           objectRefSize;
+   uint64_t       objectCount;
+   uint64_t       topLevelObject;
+   uint64_t       offsetTableOffset;
+} BPListTrailer;
+
+typedef struct BPListState {
+   unsigned char *p;
+   int i; // current offset
+   int body_length;
+   char *content, *end;
+   BPListTrailer trailer;
+} BPListState;
+
+static int ReadBObjectAt(BPListState *s, int objnum);
+
+static unsigned bplist_readInt(const void *q, int objLen)
+{
+   const unsigned char *p = q;
+   unsigned x = 0;
+   assert(objLen >=1 && objLen <=8);
+   while (objLen-->0) x = (x<<8)|*p++;
+   return x;
+}
+
+static int readBType0(BPListState *s, int objLen) // simple
+{
+   int ans = 0;
+   if (objLen == 0) ans = 0; // false
+   else if (objLen == 9) ans = 1; // true
+   else assert(0);
+   return ans;
+}
+
+static int readBType1(BPListState *s, int objLen) // int
+{
+   int ans = bplist_readInt(s->p+s->i, 1<<objLen);
+   s->i += 1<<objLen;
+   return ans;
+}
+
+static int readBType2(BPListState *s, int objLen) // real
+{
+   int ans = 0;
+   s->i += 1<<objLen;
+   return ans;
+}
+
+static int readBType3(BPListState *s, int objLen) // date
+{
+   int ans = 0;
+   s->i += 8;
+   return ans;
+}
+
+static int readBType4(BPListState *s, int objLen) // data
+{
+   int ans = s->i | (objLen << 16);
+   log_printf("bplist data [%.*s]\n", objLen, s->p+s->i);
+   s->i += objLen;
+   return ans;
+}
+
+static int readBType5(BPListState *s, int objLen) // ascii string
+{
+   int ans = s->i | (objLen << 16);
+   log_printf("bplist string [%.*s]\n", objLen, s->p+s->i);
+   s->i += objLen;
+   return ans;
+}
+
+static int readBType6(BPListState *s, int objLen) // unicode string
+{
+   int ans = s->i | (objLen << 16);
+   log_printf("bplist ustring [%.*s]\n", objLen, s->p+s->i);
+   s->i += objLen;
+   return ans;
+}
+
+static int readBTypeD(BPListState *s, int objLen) // Dictionary
+{
+   int ans = 0;
+   int i;
+   unsigned char *keys, *objs;
+
+   log_printf("bplist dictionary [%.*s]\n", objLen, s->p+s->i);
+
+   keys = s->p+s->i;
+   s->i += objLen*s->trailer.objectRefSize;
+   objs = s->p+s->i;
+   s->i += objLen*s->trailer.objectRefSize;
+
+   for (i=0; i<objLen; i++) {
+      int key = bplist_readInt(keys + i*s->trailer.objectRefSize, s->trailer.objectRefSize);
+      int obj = bplist_readInt(objs + i*s->trailer.objectRefSize, s->trailer.objectRefSize);
+      unsigned int propans  = ReadBObjectAt(s, key);
+      unsigned int valueans = ReadBObjectAt(s, obj);
+      char *prop  = (char *)s->p + (propans & 0xffff);
+      char *value = (char *)s->p + (valueans & 0xffff);
+      if (strncmp(prop, "Content-Location", STRLEN("Content-Location"))==0)
+         s->content = value, s->end = value + (valueans>>16);
+   }
+   return ans;
+}
+
+static int readBTypeX(BPListState *s, int objLen) // unimplemented
+{
+   error_printf("bplist unimplemented(%d)\n", objLen);
+   assert(0);
+}
+
+typedef int (*readBType_func_t)(BPListState *s, int objLen);
+static readBType_func_t readBType[] = {
+   readBType0, readBType1, readBType2, readBType3, readBType4, readBType5, readBType6, readBTypeX,
+   readBTypeX, readBTypeX, readBTypeX, readBTypeX, readBTypeX, readBTypeD, readBTypeX, readBTypeX,
+};
+
+static int ReadBObject(BPListState *s)
+{
+   int ans = 0;
+   log_printf("ReadBObject: %i\t %02X\n", s->i, s->p[s->i]);
+
+   int objType = s->p[s->i++], objLen = objType & 0xf;
+   objType >>= 4;
+   if (objType != 0 && objLen == 0xf)
+      objLen = ReadBObject(s);
+
+   return readBType[objType](s, objLen);
+}
+
+
+static int ReadBObjectAt(BPListState *s, int objNum)
+{
+   log_printf("ReadBObjectAt(%d): %i\t %02X\n", objNum, s->i, s->p[s->i]);
+   s->i = bplist_readInt(s->p + s->trailer.offsetTableOffset + objNum * s->trailer.offsetIntSize, s->trailer.offsetIntSize);
+   return ReadBObject(s);
+}
+
+
+static char *bplist_find_content(char *body, int body_length, char **end)
+{
+   char *content = NULL;
+   int i=0, size;
+   BPListState static_s, *s=&static_s;
+
+   assert(strncmp("bplist00", body, 8)==0);
+   memset(s, 0, sizeof *s);
+   s->p = (unsigned char *)body;
+   s->i = 8;
+   s->body_length = body_length;
+   BPListTrailer *trailer = (BPListTrailer *)(body + body_length - sizeof *trailer);
+   s->trailer = *trailer;
+   {
+      char *debug_out = malloc(3*body_length);
+      for (i=0; i<body_length; i++) {
+         sprintf(debug_out+i, "%c", s->p[i]?s->p[i]:' ');
+      }
+      s->trailer.objectCount = bplist_readInt(&trailer->objectCount, 1<<3);
+      s->trailer.topLevelObject = bplist_readInt(&trailer->topLevelObject, 1<<3);
+      s->trailer.offsetTableOffset= bplist_readInt(&trailer->offsetTableOffset, 1<<3);
+      log_printf("bplist_parse_content: offsetIntSize=%d, objectRefSize=%d, objectCount=%d, topLevelObject=%d, offsetTableOffset=%d\n[%.*s]\n", 
+                 (int)s->trailer.offsetIntSize, (int)s->trailer.objectRefSize, (int)s->trailer.objectCount, (int)s->trailer.topLevelObject, (int)s->trailer.offsetTableOffset, body_length, debug_out);
+      for (i=0; i<body_length; i++) {
+         sprintf(debug_out+i*3, "%02X ", s->p[i]);
+      }
+      log_printf("bplist_parse_content: %s\n", debug_out);
+      free(debug_out);
+   }
+
+   ReadBObjectAt(s, s->trailer.topLevelObject);
+   *end = s->end;
+   return s->content;
+}
+
 
 #if 0
 static int http_request_and_parse_num(const char *command, const char *key, int *value)
@@ -590,8 +777,8 @@ static int wait_media_ready(MEDIA_MODES_T mode, MEDIA_MODES_T last_mode, int see
             break;
          if (0 && !buffering && paused && timeout>=900) {
             error_printf("Stuck in paused - resuming: wait_media_ready(%s->%s, %d, %d, %d) failed (%d,%d,%d,%d,%d,%d,%d)\n", 
-                       modename[last_mode], modename[mode], seek_offset, *position, *duration,
-                       seekable, playing, paused, stopped, buffering, 0, media_status );
+                         modename[last_mode], modename[mode], seek_offset, *position, *duration,
+                         seekable, playing, paused, stopped, buffering, 0, media_status );
             // for no good reason youtube videos end up in paused state here
             int s = http_request("http://127.0.0.1:8008/playback?arg0=resume_vod");
             assert(s==0);
@@ -623,14 +810,14 @@ static void set_bookmark(const char *url, int time)
    FILE *fpout = fopen("/tmp/tmp_bookmark", "wt");
    int found=0;
    if (fpin && fpout) while (!feof(fpin)) {
-      if (fgets(buf, sizeof buf, fpin) == 0) break;
-      if (strstr(buf, url)) {
-         fprintf(fpout, "bookmark_time=%d toadj=0 bookmark_filename=%s\n", time, url);
-         found = 1;
-      } else {
-         fprintf(fpout, "%s", buf);
+         if (fgets(buf, sizeof buf, fpin) == 0) break;
+         if (strstr(buf, url)) {
+            fprintf(fpout, "bookmark_time=%d toadj=0 bookmark_filename=%s\n", time, url);
+            found = 1;
+         } else {
+            fprintf(fpout, "%s", buf);
+         }
       }
-   }
    if (fpout && !found)
       fprintf(fpout, "bookmark_time=%d toadj=0 bookmark_filename=%s\n", time, url);
    if (fpin) fclose(fpin);
@@ -638,6 +825,29 @@ static void set_bookmark(const char *url, int time)
    system("cp /tmp/tmp_bookmark /tmp/mono_bookmark");
 }
 #endif
+
+static int load_html(const char *format, ...)
+{
+   FILE *fp = fopen("/tmp/runme.html", "wb");
+   if (fp) {
+      va_list arg;
+      va_start(arg, format);
+      vfprintf(fp, format, arg);
+      va_end(arg);
+      fclose(fp);
+   }
+   if (fp) {
+      fp = fopen("/tmp/gaya_bc", "wb");
+   }
+   if (fp) {
+      fprintf (fp, "/tmp/runme.html");
+      fclose(fp);
+      log_printf("Wrote to /tmp/gaya_bc\n");
+   }
+   if (!fp) {
+      log_printf("failed to open /tmp/runme.html\n");
+   }
+}
 
 #ifdef A100
 static int set_media_mode_ex(MEDIA_MODES_T mode, const char *url, int seek_offset, int *position, int *duration)
@@ -657,7 +867,9 @@ static int set_media_mode_ex(MEDIA_MODES_T mode, const char *url, int seek_offse
    switch (mode) {
    default: break;
    case MEDIA_STOP:
-      if (last_mode != MEDIA_PHOTO) {send_ir_key(StopButton); usleep(3000000);}
+      if (last_mode != MEDIA_PHOTO) {
+         send_ir_key(StopButton); usleep(3000000);
+      }
       send_ir_key(BackButton);
       break;
    case MEDIA_PAUSE:
@@ -669,70 +881,56 @@ static int set_media_mode_ex(MEDIA_MODES_T mode, const char *url, int seek_offse
       get_seconds(CLOCK_RESUME);
       break;
    case MEDIA_SEEK:
-   {
-      const int hours = seek_offset / (60*60);
-      const int minutes = (seek_offset % (60*60)) / 60;
-      const int seconds = (seek_offset % (60*60)) % 60;
-      REMOTE_BUTTONS keys[11], *k=keys;
-      log_printf("seek_offset=%d (%02d:%02d:%02d)\n", seek_offset, hours, minutes, seconds);
-      if (seek_offset <= 30) {
-         send_ir_key(Number0Button);
+      {
+         const int hours = seek_offset / (60*60);
+         const int minutes = (seek_offset % (60*60)) / 60;
+         const int seconds = (seek_offset % (60*60)) % 60;
+         REMOTE_BUTTONS keys[11], *k=keys;
+         log_printf("seek_offset=%d (%02d:%02d:%02d)\n", seek_offset, hours, minutes, seconds);
+         if (seek_offset <= 30) {
+            send_ir_key(Number0Button);
+            break;
+         }
+         *k++ = TimeSeek;
+#ifdef A100
+         *k++ = Number0Button+((hours/10)%10);
+         *k++ = Number0Button+((hours)%10);
+         *k++ = Number0Button+((minutes/10)%10);
+         *k++ = Number0Button+((minutes)%10);
+         *k++ = Number0Button+((seconds/10)%10);
+         *k++ = Number0Button+((seconds)%10);
+#else
+         *k++ = LeftButton;
+         *k++ = Number0Button+((hours/10)%10);
+         *k++ = Number0Button+((hours)%10);
+         *k++ = RightButton;
+         *k++ = Number0Button+((minutes/10)%10);
+         *k++ = Number0Button+((minutes)%10);
+         *k++ = RightButton;
+         *k++ = Number0Button+((seconds/10)%10);
+         *k++ = Number0Button+((seconds)%10);
+         *k++ = OkButton;
+#endif
+         send_ir_keys(keys, k-keys);
          break;
       }
-      *k++ = TimeSeek;
-#ifdef A100
-      *k++ = Number0Button+((hours/10)%10);
-      *k++ = Number0Button+((hours)%10);
-      *k++ = Number0Button+((minutes/10)%10);
-      *k++ = Number0Button+((minutes)%10);
-      *k++ = Number0Button+((seconds/10)%10);
-      *k++ = Number0Button+((seconds)%10);
-#else
-      *k++ = LeftButton;
-      *k++ = Number0Button+((hours/10)%10);
-      *k++ = Number0Button+((hours)%10);
-      *k++ = RightButton;
-      *k++ = Number0Button+((minutes/10)%10);
-      *k++ = Number0Button+((minutes)%10);
-      *k++ = RightButton;
-      *k++ = Number0Button+((seconds/10)%10);
-      *k++ = Number0Button+((seconds)%10);
-      *k++ = OkButton;
-#endif
-      send_ir_keys(keys, k-keys);
-      break;
-   }
    case MEDIA_PLAY:
    case MEDIA_PHOTO:
       get_seconds(CLOCK_RESET);
       UrlEncode(url, cmd, MAX_SEND-1);
-      fp = fopen("/tmp/runme.html", "wb");
-      if (fp) {
-         if (mode==MEDIA_PHOTO) {
-            fprintf (fp ,"<body bgcolor=black link=black>");
-            fprintf (fp ,"<center><img src=\"%s\" height=\"%d\"></center>", cmd, 680);
-            fprintf (fp ,"<a href='http://127.0.0.1:8883/start.cgi?list' tvid='home'></a>");
-            fprintf (fp ,"<a href='http://127.0.0.1:8883/start.cgi?list' tvid='source'></a>");
-            //fprintf (fp ,"<br><font size='6' color='#ffffff'><b>Press Return on your remote to go back to your previous location</b></font>\n");
-         } else {
-            fprintf (fp ,"<body bgcolor=black link=black onloadset='go'>");
-            fprintf (fp ,"<a onfocusload name='go' href='%s' %s></a>", cmd, mode==MEDIA_PLAY?"vod":"");
-            fprintf (fp ,"<a href='http://127.0.0.1:8883/start.cgi?list' tvid='home'></a>");
-            fprintf (fp ,"<a href='http://127.0.0.1:8883/start.cgi?list' tvid='source'></a>");
-            fprintf (fp ,"<br><font size='6' color='#ffffff'><b>Press Return on your remote to go back to your previous location</b></font>\n");
-         }
-         fclose(fp);
-      }
-      if (fp) {
-         fp = fopen("/tmp/gaya_bc", "wb");
-      }
-      if (fp) {
-         fprintf (fp, "/tmp/runme.html");
-         fclose(fp);
-         log_printf("Wrote to /tmp/gaya_bc\n");
-      }
-      if (!fp) {
-         log_printf("failed to open /tmp/runme.html\n");
+
+      if (mode==MEDIA_PHOTO) {
+         load_html(          "<body bgcolor=black link=black>"
+                             "<center><img src=\"%s\" height=\"%d\"></center>"
+                             "<a href='http://127.0.0.1:8883/start.cgi?list' tvid='home'></a>"
+                             "<a href='http://127.0.0.1:8883/start.cgi?list' tvid='source'></a>", cmd, 680);
+         //"<br><font size='6' color='#ffffff'><b>Press Return on your remote to go back to your previous location</b></font>\n"
+      } else {
+         load_html(          "<body bgcolor=black link=black onloadset='go'>"
+                             "<a onfocusload name='go' href='%s' %s></a>"
+                             "<a href='http://127.0.0.1:8883/start.cgi?list' tvid='home'></a>"
+                             "<a href='http://127.0.0.1:8883/start.cgi?list' tvid='source'></a>"
+                             "<br><font size='6' color='#ffffff'><b>Press Return on your remote to go back to your previous location</b></font>\n", cmd, mode==MEDIA_PLAY?"vod":"");
       }
       break;
    }
@@ -882,12 +1080,14 @@ static int read_from_client(int filedes)
 {
    char *buffer = malloc(MAX_HEADER+1); // allow null on end
    char *content = malloc(MAX_RESPONSE);
+   char *header = malloc(MAX_RESPONSE);
    int nbytes;
    char *found;
    int status = STATUS_OK;
    char *body=0; int body_size = 0;
-   assert(buffer && content);
+   assert(buffer && content && header);
    content[0] = '\0';
+   header[0] = '\0';
    nbytes = http_read_header(filedes, buffer, MAX_HEADER, &body, &body_size);
    if (nbytes > 0) {
       buffer[nbytes] = '\0';
@@ -910,30 +1110,44 @@ static int read_from_client(int filedes)
          last_position = last_scrub;
          last_scrub = -1;
       }
-   } else if (found = strstr(buffer,"/play"), found) {
+   } else if (found = strstr(buffer,"/play "), found) {
       int proxy = a100;
-      found = strstr(buffer, "User-Agent: ");
-      if (found) {
-         found += STRLEN("User-Agent: ");
-         if (strncmp(found, "iTunes", STRLEN("iTunes"))==0)
-            proxy=1;
+      int binaryplist = strstr(buffer, "application/x-apple-binary-plist") != 0;
+      if (!binaryplist) {
+         found = strstr(buffer, "User-Agent: ");
+         if (found) {
+            found += STRLEN("User-Agent: ");
+            if (strncmp(found, "iTunes", STRLEN("iTunes"))==0)
+               proxy=1;
+         }
+         found = strstr(buffer, "Content-Location: ");
+         if (found) {
+            found += STRLEN("Content-Location: ");
+            char *newline = strchr(found, '\n');
+            if (newline) *newline = '\0';
+            else found = 0;
+         }
+      } else {
+         int length=0;
+         char *end = NULL;
+         found = bplist_find_content(body, body_size, &end);
+         if (found) {
+            if (end) *end = '\0';
+            else found = 0;
+         }
       }
-      found = strstr(buffer, "Content-Location: ");
-      if (found) {
-         found += STRLEN("Content-Location: ");
-         char *newline = strchr(found, '\n');
-         if (newline) *newline = '\0';
-         else found = 0;
+      if (found && !media_supported(found)) {
+         load_html( HTML_REPORT_ERRROR2, "Media type not supported:", found);
+         found = 0;
       }
-      if (found && !media_supported(found)) found = 0;
       if (found) {
          fprintf (stderr, "Found content: %s\n", found);
          UrlMangle(found, airplay_url, sizeof airplay_url, proxy);
 #ifdef A100
          set_bookmark(airplay_url, last_scrub);
          set_media_mode_url(MEDIA_PLAY, airplay_url);
-            last_position = last_scrub;
-            last_scrub = -1;
+         last_position = last_scrub;
+         last_scrub = -1;
 
 #else
          if (last_scrub >= 0) {
@@ -970,10 +1184,10 @@ static int read_from_client(int filedes)
             position = last_position;
             duration = last_duration;
          } else {
-            #ifndef A100
+#ifndef A100
             last_duration = duration;
             last_position = position;
-            #endif
+#endif
          }
       }
       if (itunes && last_scrub >= 0) {
@@ -1008,15 +1222,37 @@ static int read_from_client(int filedes)
    } else if (found = strstr(buffer,"/volume"), found) {
       // ignore
    } else if (found = strstr(buffer,"/server-info"), found) {
-      // what to do here?
+      sprintf(content, SERVER_INFO);
+      sprintf(header, "Content-Type: text/x-apple-plist+xml"NL);
+   } else if (found = strstr(buffer,"/playback-info"), found) {
+      int position=0, duration=0;
+      int playing=0, paused=0, stopped=0, buffering=0, seekable=0;
+      int media_status = get_media_info(&position, &duration, &playing, &paused, &stopped, &buffering, &seekable);
+      if (media_status != 0 || !playing || paused) {
+         position = last_position;
+         duration = last_duration;
+      } else {
+#ifndef A100
+         last_duration = duration;
+         last_position = position;
+#endif
+      }
+      sprintf(content, PLAYBACK_INFO, (float)duration, (float)duration, (float)position, playing, (float)duration);
+      sprintf(header, "Content-Type: text/x-apple-plist+xml"NL);
+   } else if (found = strstr(buffer,"/slideshow-features"), found) {
+      status = STATUS_NOT_IMPLEMENTED;
+   } else if (found = strstr(buffer,"/authorize"), found) {
+      load_html( HTML_REPORT_ERRROR2, "DRM protected content not supported", "");
+      status = STATUS_NOT_IMPLEMENTED;
    } else {
       fprintf (stderr, "Unhandled [%s]\n", buffer);
       status = STATUS_NOT_IMPLEMENTED;
    }
-   if (status) http_response(filedes, status, http_status_string(status), content[0] ? content:NULL);
+   if (status) http_response(filedes, status, http_status_string(status), content[0] ? content:NULL, header[0] ? header:NULL);
    fail:
    if (buffer) free(buffer);
    if (content) free(content);
+   if (header) free(header);
    return status==STATUS_OK || status==STATUS_SWITCHING_PROTOCOLS ? 0:-status;
 }
 
@@ -1183,7 +1419,7 @@ OK<
       //fprintf(stderr, "%d/%d\n", nbytes, remaining);
    }
    assert(remaining == 0);
-err_closed:
+   err_closed:
    close(sockfd);
    status = 1;
    fail:
