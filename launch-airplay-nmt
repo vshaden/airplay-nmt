@@ -1,4 +1,4 @@
 #gcc -O -EL airplay-nmt.c -o airplay-nmt
 killall mDNSrespd-mips
-/nmt/apps/server/mDNSrespd-mips -n NMT -t _airplay._tcp -x deviceid=FF:FF:FF:FF:FF:FFfeatures=0x7model=AppleTV2,1 -p 6000 -b
+/nmt/apps/server/mDNSrespd-mips -n NMT -t _airplay._tcp -x deviceid=FF:FF:FF:FF:FF:FF`echo -ne "\x1"`features=0x77`echo -ne "\x1"`model=AppleTV2,1`echo -ne "\x1"`srcvers=101.10 -p 6000 -b
 ./airplay-nmt $*
