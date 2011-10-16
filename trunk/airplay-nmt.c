@@ -22,6 +22,7 @@
 #define MAX_HEADER   5120
 #define MAX_RESPONSE 5120
 #define MAX_SEND 5120
+#define MAX_PROXY_BUFFER (64*1024)
 #define NL "\r\n"
 
 #define max(a,b) ((a)>(b)?(a):(b))
@@ -86,13 +87,17 @@ enum {
 
 static char airplay_url[MAX_SEND];
 
+static int proxyon=1, proxyoff;
 static int loglevel=1;
 
+enum {LOG_PROXY, LOG_MAIN };
+static char *logs[] = {"PROXY", "MAIN "};
+
+#define WILL_LOG (!(loglevel<2))
 #define log_printf(...) if (loglevel<2) {} else stamped_printf(stdout, __VA_ARGS__)
 #define error_printf(...) if (loglevel<1) {} else stamped_printf(stderr, __VA_ARGS__)
 #define STRLEN(s) (sizeof(s)-1)
 #define perror_abort(s) do {perror(s); exit(EXIT_FAILURE);}while(0)
-
 
 typedef enum {
    CLOCK_READ, CLOCK_RESET, CLOCK_PAUSE, CLOCK_RESUME
@@ -110,32 +115,49 @@ static unsigned get_seconds(CLOCK_MODE_T clock_mode)
 }
 
 
-static int stamped_printf(FILE *fp, const char *format, ...)
+static int stamped_printf(FILE *fp, int log, const char *format, ...)
 {
    va_list arg;
    int done;
    const time_t ltime=time(NULL); /* get current cal time */
    char buf[32];
    done = strftime(buf, sizeof buf, "%H:%M:%S", localtime(&ltime));
-   done = fprintf(fp, "%s:", buf);
+   done = fprintf(fp, "[%s]%s:", logs[log], buf);
    va_start(arg, format);
    done += vfprintf(fp, format, arg);
    va_end(arg);
    return done;
 }
 
+static char *get_mac_addr(void)
+{
+   static char mac[] = "00:00:00:00:00:00";
+   char buf[256];
+   FILE *fp = fopen("/sys/class/net/eth0/address", "rt");
+   if (fp) {
+      if (fgets(buf, sizeof buf, fp) > 0) {
+         strncpy(mac, buf, sizeof(mac)-1);
+         //error_printf(LOG_MAIN, "[%s][%s]\n", buf,mac);
+      }
+      fclose(fp);
+   }
+   return mac;
+}
 
 static char *UrlMangle(const char *szText, char *szDst, int bufsize, int want_proxy)
 {
    char ch; 
-   char szHex[5];
    int iMax,i,j; 
 
    iMax = bufsize-2;
    szDst[0]='\0';
    for (i = 0,j=0; szText[i] && j <= iMax; i++) {
       ch = szText[i];
-      if (want_proxy && strncmp(szText+i, "http://", STRLEN("http://"))==0) {
+      if (strncmp(szText+i, "http://trailers.apple.com", STRLEN("http://trailers.apple.com"))==0) {
+         strcpy(szDst+j, "http://127.0.0.1:7000/proxy?useragent=Quicktime&url=http");
+         j += STRLEN("http://127.0.0.1:7000/proxy?useragent=Quicktime&url=http");
+         i += STRLEN("http")-1;
+      } else if (want_proxy && strncmp(szText+i, "http://", STRLEN("http://"))==0) {
          strcpy(szDst+j, "http://127.0.0.1:7000/proxy?url=http");
          j += STRLEN("http://127.0.0.1:7000/proxy?url=http");
          i += STRLEN("http")-1;
@@ -220,7 +242,7 @@ static char *strnstr(const char *s1, const char *s2, size_t n)
    may have read some of body, which will be pointed to by body (first byte after NL NL)
    returns bytes read into response, or negative for error
 */
-static int http_read_header(int sockfd, char *response, int response_size, char **body, int *body_size)
+static int http_read_header(int log, int sockfd, char *response, int response_size, char **body, int *body_size)
 {
    int bytes_read=0;
    if (!response) return 0;
@@ -228,8 +250,8 @@ static int http_read_header(int sockfd, char *response, int response_size, char 
    if (body_size) *body_size = 0;
    while (1) {
       int nbytes = read(sockfd, response+bytes_read, response_size-bytes_read);
-      //error_printf("% 6d: [%.*s]\n", nbytes, nbytes < 0 ? 0:nbytes, response+bytes_read);
-      //log_printf("http_read_header: read=%d, %d/%d\n", nbytes, bytes_read, response_size);
+      //error_printf(log, "% 6d: [%.*s]\n", nbytes, nbytes < 0 ? 0:nbytes, response+bytes_read);
+      //log_printf(log, "http_read_header: read=%d, %d/%d\n", nbytes, bytes_read, response_size);
       if (nbytes < 0) {
          /* Read error. */
          //perror_abort("http_read_header");
@@ -252,20 +274,20 @@ static int http_read_header(int sockfd, char *response, int response_size, char 
       }
    }
    int header_size = body && *body ? *body - response: bytes_read;
-   log_printf("http_read_header(%d): DONE %d/%d\n[%.*s]...%d\n", sockfd, bytes_read, response_size, header_size, response, body_size ? *body_size:0 );
+   log_printf(log, "http_read_header(%d): DONE %d/%d\n[%.*s]...%d\n", sockfd, bytes_read, response_size, header_size, response, body_size ? *body_size:0 );
    return bytes_read;
 }
 
 
-static int socket_read(int sockfd, char *buffer, int length)
+static int socket_read(int log, int sockfd, char *buffer, int length)
 {
    int bytes_read=0, nbytes = 0;
    int remaining = length;
    assert(buffer);
    while (1) {
       nbytes = read(sockfd, buffer+bytes_read, remaining);
-      //error_printf("% 6d: [%.*s]\n", nbytes, nbytes > 0 ? 0:nbytes, buffer+bytes_read);
-      //log_printf("% 6d %d\n", nbytes, remaining);
+      //error_printf(log, "% 6d: [%.*s]\n", nbytes, nbytes > 0 ? 0:nbytes, buffer+bytes_read);
+      //log_printf(log, "% 6d %d\n", nbytes, remaining);
       if (nbytes < 0) {
          /* Read error. */
          //perror_abort("socket_read");
@@ -280,23 +302,23 @@ static int socket_read(int sockfd, char *buffer, int length)
          assert(bytes_read <= length);
       }
    }
-   if (bytes_read < 4096) log_printf("socket_read(%d): DONE %d/%d (%d)\n[%.*s]\n", sockfd, bytes_read, length, remaining, bytes_read, buffer);
-   else log_printf("socket_read(%d): DONE %d/%d (%d)\n", sockfd, bytes_read, length, remaining);
+   if (bytes_read < 4096) log_printf(log, "socket_read(%d): DONE %d/%d (%d)\n[%.*s]\n", sockfd, bytes_read, length, remaining, bytes_read, buffer);
+   else log_printf(log, "socket_read(%d): DONE %d/%d (%d)\n", sockfd, bytes_read, length, remaining);
    return bytes_read > 0 ? bytes_read : nbytes;
 }
 
-static int socket_write(int sockfd, const char *buffer, int length)
+static int socket_write(int log, int sockfd, const char *buffer, int length)
 {
    int bytes_written=0;
    int remaining = length;
    if (buffer) while (1) {
          int nbytes = write(sockfd, buffer+bytes_written, remaining);
-         //error_printf("% 6d: [%.*s]\n", nbytes, nbytes < 0 ? 0:nbytes, buffer+bytes_written);
+         //error_printf(LOG_MAIN, "% 6d: [%.*s]\n", nbytes, nbytes < 0 ? 0:nbytes, buffer+bytes_written);
          //printf("socket_write: read=%d, %d/%d\n", nbytes, bytes_read, response_size);
          if (nbytes < 0) {
             /* Write error. */
             if (bytes_written < length) {
-               error_printf("socket_write(%d)=%d: DONE %d/%d (%d)\n", sockfd, nbytes, bytes_written, length, remaining);
+               error_printf(log, "socket_write(%d)=%d: DONE %d/%d (%d)\n", sockfd, nbytes, bytes_written, length, remaining);
                break;
                //perror_abort("socket_write");
             }
@@ -310,12 +332,12 @@ static int socket_write(int sockfd, const char *buffer, int length)
             remaining -= nbytes;
          }
       }
-   if (bytes_written < 4096) log_printf("socket_write(%d): DONE %d/%d (%d)\n[%.*s]\n", sockfd, bytes_written, length, remaining, bytes_written, buffer);
-   else log_printf("socket_write(%d): DONE %d/%d (%d)\n", sockfd, bytes_written, length, remaining);
+   if (bytes_written < 4096) log_printf(log, "socket_write(%d): DONE %d/%d (%d)\n[%.*s]\n", sockfd, bytes_written, length, remaining, bytes_written, buffer);
+   else log_printf(log, "socket_write(%d): DONE %d/%d (%d)\n", sockfd, bytes_written, length, remaining);
    return bytes_written;
 }
 
-static void http_response(int sockfd, int status, const char *status_string, const char *content, const char *header)
+static void http_response(int log, int sockfd, int status, const char *status_string, const char *content, const char *header)
 {
    char response[MAX_RESPONSE];
    const time_t ltime=time(NULL); /* get current cal time */
@@ -325,14 +347,14 @@ static void http_response(int sockfd, int status, const char *status_string, con
    if (header) strcat(response, header);
    if (content) strcat(response, ""NL), strcat(response, content);
    strcat(response, ""NL);
-   //if (status != STATUS_SWITCHING_PROTOCOLS) {log_printf("{%s}\n", response);}
-   int s = socket_write(sockfd, response, strlen(response));
+   //if (status != STATUS_SWITCHING_PROTOCOLS) {log_printf(LOG_MAIN, "{%s}\n", response);}
+   int s = socket_write(log, sockfd, response, strlen(response));
    assert(s==strlen(response));
-   //log_printf("http_response(%d): DONE (%d)\n[%.*s]\n", sockfd, s, s, content);
+   //log_printf(log, "http_response(%d): DONE (%d)\n[%.*s]\n", sockfd, s, s, content);
 }
 
 
-static int make_socket_out(struct in_addr sin_addr, int port)
+static int make_socket_out(int log, struct in_addr sin_addr, int port)
 {
    struct sockaddr_in  server;
    int s, sockfd = socket(AF_INET,SOCK_STREAM,0);
@@ -350,17 +372,17 @@ static int make_socket_out(struct in_addr sin_addr, int port)
    if (s = connect(sockfd, (struct sockaddr *)&server, sizeof server), s) {
       perror_abort("error connecting");
    }
-   log_printf("make_socket_out(%d.%d.%d.%d:%d)=%d\n", (sin_addr.s_addr>>0)&0xff,(sin_addr.s_addr>>8)&0xff,(sin_addr.s_addr>>16)&0xff,(sin_addr.s_addr>>24)&0xff, port, sockfd);
+   log_printf(log, "make_socket_out(%d.%d.%d.%d:%d)=%d\n", (sin_addr.s_addr>>0)&0xff,(sin_addr.s_addr>>8)&0xff,(sin_addr.s_addr>>16)&0xff,(sin_addr.s_addr>>24)&0xff, port, sockfd);
    return sockfd;
 }
 
 
-int sendCommandGetResponse(struct in_addr sin_addr, int port, const char *cmd, char *response, int response_size)
+int sendCommandGetResponse(int log, struct in_addr sin_addr, int port, const char *cmd, char *response, int response_size)
 {
-   int sockfd=make_socket_out(sin_addr, port);
-   int s = socket_write(sockfd, cmd, strlen(cmd));
+   int sockfd=make_socket_out(log, sin_addr, port);
+   int s = socket_write(log, sockfd, cmd, strlen(cmd));
    assert(s == strlen(cmd));
-   int bytes_read = socket_read(sockfd, response, response_size);
+   int bytes_read = socket_read(log, sockfd, response, response_size);
    close(sockfd);
    response[min(bytes_read, response_size-1)] = '\0';
    return 0;
@@ -381,12 +403,12 @@ static int sendCommand(int port, const char *cmd)
 #endif
 
 static void ignore_signal(int sig) {
-   error_printf("Ignored signal %d\n", sig);
+   error_printf(LOG_MAIN, "Ignored signal %d\n", sig);
 }
 
 static void ex_program(int sig) {
 #if 1
-   error_printf("Wake up call ... !!! - Caught signal: %d ... !!\n", sig);
+   error_printf(LOG_MAIN, "Wake up call ... !!! - Caught signal: %d ... !!\n", sig);
    fflush(stdout);
    fflush(stderr);
    exit(EXIT_FAILURE);
@@ -397,7 +419,7 @@ static void ex_program(int sig) {
 #endif
 }
 
-static int http_request_with_response(const char *url, char *response, int response_size)
+static int http_request_with_response(int log, const char *url, char *response, int response_size)
 {
    char command[MAX_SEND];
    char host[MAX_SEND] = "localhost";
@@ -411,7 +433,7 @@ static int http_request_with_response(const char *url, char *response, int respo
    if (p) port = atoi(p+1);
    if (p) p = strstr(p, "/");
    if (!p) return -1;
-   log_printf("parsed [%s] to [%s] %d (%d)\n", url, host, port, s);
+   log_printf(log, "parsed [%s] to [%s] %d (%d)\n", url, host, port, s);
 
    struct hostent     *he;
    if ((he = gethostbyname(host)) == NULL) {
@@ -425,13 +447,13 @@ static int http_request_with_response(const char *url, char *response, int respo
            "Host: %.*s"NL
            "Connection: Keep-Alive"NL
            , url+strlen(url)-p, p, p-url, url);
-   return sendCommandGetResponse(sin_addr, port, command, response, response_size);
+   return sendCommandGetResponse(log, sin_addr, port, command, response, response_size);
 }
 
-static int http_request_and_parse_nums(const char *command, const char *key[], int *value)
+static int http_request_and_parse_nums(int log, const char *command, const char *key[], int *value)
 {
    char response[MAX_RESPONSE];
-   int s = http_request_with_response(command, response, sizeof response);
+   int s = http_request_with_response(log, command, response, sizeof response);
    char *p; int v=0;
    while (s==0 && key && *key) {
       if (*key[0] == '?') { // boolean
@@ -509,7 +531,7 @@ static int readBType3(BPListState *s, int objLen) // date
 static int readBType4(BPListState *s, int objLen) // data
 {
    int ans = s->i | (objLen << 16);
-   log_printf("bplist data [%.*s]\n", objLen, s->p+s->i);
+   log_printf(LOG_MAIN, "bplist data [%.*s]\n", objLen, s->p+s->i);
    s->i += objLen;
    return ans;
 }
@@ -517,7 +539,7 @@ static int readBType4(BPListState *s, int objLen) // data
 static int readBType5(BPListState *s, int objLen) // ascii string
 {
    int ans = s->i | (objLen << 16);
-   log_printf("bplist string [%.*s]\n", objLen, s->p+s->i);
+   log_printf(LOG_MAIN, "bplist string [%.*s]\n", objLen, s->p+s->i);
    s->i += objLen;
    return ans;
 }
@@ -525,7 +547,7 @@ static int readBType5(BPListState *s, int objLen) // ascii string
 static int readBType6(BPListState *s, int objLen) // unicode string
 {
    int ans = s->i | (objLen << 16);
-   log_printf("bplist ustring [%.*s]\n", objLen, s->p+s->i);
+   log_printf(LOG_MAIN, "bplist ustring [%.*s]\n", objLen, s->p+s->i);
    s->i += objLen;
    return ans;
 }
@@ -536,7 +558,7 @@ static int readBTypeD(BPListState *s, int objLen) // Dictionary
    int i;
    unsigned char *keys, *objs;
 
-   log_printf("bplist dictionary [%.*s]\n", objLen, s->p+s->i);
+   log_printf(LOG_MAIN, "bplist dictionary [%.*s]\n", objLen, s->p+s->i);
 
    keys = s->p+s->i;
    s->i += objLen*s->trailer.objectRefSize;
@@ -558,7 +580,7 @@ static int readBTypeD(BPListState *s, int objLen) // Dictionary
 
 static int readBTypeX(BPListState *s, int objLen) // unimplemented
 {
-   error_printf("bplist unimplemented(%d)\n", objLen);
+   error_printf(LOG_MAIN, "bplist unimplemented(%d)\n", objLen);
    assert(0);
 }
 
@@ -571,7 +593,7 @@ static readBType_func_t readBType[] = {
 static int ReadBObject(BPListState *s)
 {
    int ans = 0;
-   log_printf("ReadBObject: %i\t %02X\n", s->i, s->p[s->i]);
+   log_printf(LOG_MAIN, "ReadBObject: %i\t %02X\n", s->i, s->p[s->i]);
 
    int objType = s->p[s->i++], objLen = objType & 0xf;
    objType >>= 4;
@@ -584,7 +606,7 @@ static int ReadBObject(BPListState *s)
 
 static int ReadBObjectAt(BPListState *s, int objNum)
 {
-   log_printf("ReadBObjectAt(%d): %i\t %02X\n", objNum, s->i, s->p[s->i]);
+   log_printf(LOG_MAIN, "ReadBObjectAt(%d): %i\t %02X\n", objNum, s->i, s->p[s->i]);
    s->i = bplist_readInt(s->p + s->trailer.offsetTableOffset + objNum * s->trailer.offsetIntSize, s->trailer.offsetIntSize);
    return ReadBObject(s);
 }
@@ -603,20 +625,20 @@ static char *bplist_find_content(char *body, int body_length, char **end)
    s->body_length = body_length;
    BPListTrailer *trailer = (BPListTrailer *)(body + body_length - sizeof *trailer);
    s->trailer = *trailer;
-   {
-      char *debug_out = malloc(3*body_length);
+   if (WILL_LOG) {
+      char *debug_out = malloc(3*body_length+1);
       for (i=0; i<body_length; i++) {
          sprintf(debug_out+i, "%c", s->p[i]?s->p[i]:' ');
       }
       s->trailer.objectCount = bplist_readInt(&trailer->objectCount, 1<<3);
       s->trailer.topLevelObject = bplist_readInt(&trailer->topLevelObject, 1<<3);
       s->trailer.offsetTableOffset= bplist_readInt(&trailer->offsetTableOffset, 1<<3);
-      log_printf("bplist_parse_content: offsetIntSize=%d, objectRefSize=%d, objectCount=%d, topLevelObject=%d, offsetTableOffset=%d\n[%.*s]\n", 
+      log_printf(LOG_MAIN, "bplist_parse_content: offsetIntSize=%d, objectRefSize=%d, objectCount=%d, topLevelObject=%d, offsetTableOffset=%d\n[%.*s]\n", 
                  (int)s->trailer.offsetIntSize, (int)s->trailer.objectRefSize, (int)s->trailer.objectCount, (int)s->trailer.topLevelObject, (int)s->trailer.offsetTableOffset, body_length, debug_out);
       for (i=0; i<body_length; i++) {
          sprintf(debug_out+i*3, "%02X ", s->p[i]);
       }
-      log_printf("bplist_parse_content: %s\n", debug_out);
+      log_printf(LOG_MAIN, "bplist_parse_content: %s\n", debug_out);
       free(debug_out);
    }
 
@@ -634,10 +656,10 @@ static int http_request_and_parse_num(const char *command, const char *key, int 
 }
 #endif
 
-static int http_request(const char *command)
+static int http_request(int log, const char *command)
 {
    char response[MAX_RESPONSE];
-   int s = http_request_with_response(command, response, sizeof response);
+   int s = http_request_with_response(log, command, response, sizeof response);
    return s;
 }
 
@@ -665,7 +687,7 @@ static int get_media_info(int *position, int *duration, int *playing, int *pause
 {
    const char *keys[] = {"?<returnValue>0", "<currentTime>", "<totalTime>", "?<currentStatus>play", "?<currentStatus>pause", "?<currentStatus>stop", "?<currentStatus>buffering", "?<seekEnable>true", NULL};
    int values[countof(keys)]={0};
-   http_request_and_parse_nums("http://127.0.0.1:8008/playback?arg0=get_current_vod_info", keys, values);
+   http_request_and_parse_nums(LOG_MAIN, "http://127.0.0.1:8008/playback?arg0=get_current_vod_info", keys, values);
    if (position) *position =values[1];
    if (duration) *duration =values[2];
    if (playing)  *playing  =values[3];
@@ -679,7 +701,7 @@ static int get_photo_info(int *position, int *duration, int *playing, int *pause
 {
    const char *keys[] = {"?<returnValue>0", "<currentTime>", "<totalTime>", "?<currentStatus>play", "?<currentStatus>pause", "?<currentStatus>stop", "?<currentStatus>buffering", "?<seekEnable>true", NULL};
    int values[countof(keys)]={0};
-   http_request_and_parse_nums("http://127.0.0.1:8008/playback?arg0=get_current_pod_info", keys, values);
+   http_request_and_parse_nums(LOG_MAIN, "http://127.0.0.1:8008/playback?arg0=get_current_pod_info", keys, values);
    if (position) *position =values[1];
    if (duration) *duration =values[2];
    if (playing)  *playing  =values[3];
@@ -694,7 +716,7 @@ static int get_system_mode(int *browser, int *pod_playback, int *vod_playback)
 {
    const char *keys[] = {"?<returnValue>0", "?<apps>browser", "?<apps>POD_playback", "<apps>VOD_playback", NULL};
    int values[countof(keys)]={0};
-   http_request_and_parse_nums("http://127.0.0.1:8008/system?arg0=get_current_app", keys, values);
+   http_request_and_parse_nums(LOG_MAIN, "http://127.0.0.1:8008/system?arg0=get_current_app", keys, values);
    if (browser) *browser=values[1];
    if (pod_playback) *pod_playback =values[2];
    if (vod_playback) *vod_playback=values[3];
@@ -709,7 +731,7 @@ static void send_ir_keys(REMOTE_BUTTONS *code, int num)
       int i;
       for (i=0; i<num; i++) {
          fprintf (fp ,"%d\n", code[i]);
-         log_printf("Wrote %d to /tmp/ir_key\n", code[i]);
+         log_printf(LOG_MAIN, "Wrote %d to /tmp/ir_key\n", code[i]);
       }
       fclose(fp);
    } else assert(0);
@@ -725,9 +747,9 @@ static void send_ir_keys(REMOTE_BUTTONS *code, int num)
    }
    memcpy(&sin_addr, he->h_addr_list[0], sizeof sin_addr);
 
-   sockfd = make_socket_out(sin_addr, 30000);
+   sockfd = make_socket_out(LOG_MAIN, sin_addr, 30000);
    if (sockfd > 0) {
-      s = socket_write(sockfd, (char *)code, num);
+      s = socket_write(LOG_MAIN, sockfd, (char *)code, num);
       assert(s == num);
       close(sockfd);
    } else assert(0);
@@ -748,13 +770,13 @@ static int wait_media_ready(MEDIA_MODES_T mode, MEDIA_MODES_T last_mode, int see
       if (mode == MEDIA_PHOTO || last_mode == MEDIA_PHOTO) {
          media_status = get_photo_info(position, duration, &playing, &paused, &stopped, &buffering, &seekable);
          if (media_status!=0) {
-            log_printf("************ media_status = %d ****************\n", media_status);
+            log_printf(LOG_MAIN, "************ media_status = %d ****************\n", media_status);
             stopped = 1;
          }
       } else {
          media_status = get_media_info(position, duration, &playing, &paused, &stopped, &buffering, &seekable);
          if (media_status!=0) {
-            log_printf("************ media_status = %d ****************\n", media_status);
+            log_printf(LOG_MAIN, "************ media_status = %d ****************\n", media_status);
             //return media_status;
          }
       }
@@ -776,11 +798,11 @@ static int wait_media_ready(MEDIA_MODES_T mode, MEDIA_MODES_T last_mode, int see
          if (playing && !buffering && seekable && !paused)
             break;
          if (0 && !buffering && paused && timeout>=900) {
-            error_printf("Stuck in paused - resuming: wait_media_ready(%s->%s, %d, %d, %d) failed (%d,%d,%d,%d,%d,%d,%d)\n", 
+            error_printf(LOG_MAIN, "Stuck in paused - resuming: wait_media_ready(%s->%s, %d, %d, %d) failed (%d,%d,%d,%d,%d,%d,%d)\n", 
                          modename[last_mode], modename[mode], seek_offset, *position, *duration,
                          seekable, playing, paused, stopped, buffering, 0, media_status );
             // for no good reason youtube videos end up in paused state here
-            int s = http_request("http://127.0.0.1:8008/playback?arg0=resume_vod");
+            int s = http_request(LOG_MAIN, "http://127.0.0.1:8008/playback?arg0=resume_vod");
             assert(s==0);
          }
       } else if (mode == MEDIA_PHOTO) {
@@ -788,14 +810,14 @@ static int wait_media_ready(MEDIA_MODES_T mode, MEDIA_MODES_T last_mode, int see
             break;
       }
       if (timeout++ == 250) {
-         log_printf("TIMEOUT: wait_media_ready(%s->%s, %d, %d, %d) failed (%d,%d,%d,%d,%d,%d,%d)\n", 
+         log_printf(LOG_MAIN, "TIMEOUT: wait_media_ready(%s->%s, %d, %d, %d) failed (%d,%d,%d,%d,%d,%d,%d)\n", 
                     modename[last_mode], modename[mode], seek_offset, *position, *duration,
                     seekable, playing, paused, stopped, buffering, 0, media_status );
          break;
       }
       usleep(10000); // 0.1s
    }
-   log_printf("wait_media_ready(%s->%s, %d, %d, %d) okay (%d,%d,%d,%d,%d,%d,%d)\n", 
+   log_printf(LOG_MAIN, "wait_media_ready(%s->%s, %d, %d, %d) okay (%d,%d,%d,%d,%d,%d,%d)\n", 
               modename[last_mode], modename[mode], seek_offset, *position, *duration,
               seekable, playing, paused, stopped, buffering, 0, media_status );
    return media_status;
@@ -842,10 +864,10 @@ static int load_html(const char *format, ...)
    if (fp) {
       fprintf (fp, "/tmp/runme.html");
       fclose(fp);
-      log_printf("Wrote to /tmp/gaya_bc\n");
+      log_printf(LOG_MAIN, "Wrote to /tmp/gaya_bc\n");
    }
    if (!fp) {
-      log_printf("failed to open /tmp/runme.html\n");
+      log_printf(LOG_MAIN, "failed to open /tmp/runme.html\n");
    }
 }
 
@@ -861,12 +883,13 @@ static int set_media_mode_ex(MEDIA_MODES_T mode, const char *url, int seek_offse
    if (!position) position=&dummy_position;
    if (!duration) duration=&dummy_duration;
 
-   log_printf("### set_media_mode_ex(%s,%d)\n", modename[mode], seek_offset);
+   log_printf(LOG_MAIN, "### set_media_mode_ex(%s,%d)\n", modename[mode], seek_offset);
    if (last_mode == MEDIA_STOP && mode != MEDIA_STOP && mode != MEDIA_PLAY && mode != MEDIA_PHOTO && airplay_url[0])
       set_media_mode_ex(MEDIA_PLAY, airplay_url, seek_offset, position, duration);
    switch (mode) {
    default: break;
    case MEDIA_STOP:
+      if (last_mode == MEDIA_STOP) break;
       if (last_mode != MEDIA_PHOTO) {
          send_ir_key(StopButton); usleep(3000000);
       }
@@ -886,7 +909,7 @@ static int set_media_mode_ex(MEDIA_MODES_T mode, const char *url, int seek_offse
          const int minutes = (seek_offset % (60*60)) / 60;
          const int seconds = (seek_offset % (60*60)) % 60;
          REMOTE_BUTTONS keys[11], *k=keys;
-         log_printf("seek_offset=%d (%02d:%02d:%02d)\n", seek_offset, hours, minutes, seconds);
+         log_printf(LOG_MAIN, "seek_offset=%d (%02d:%02d:%02d)\n", seek_offset, hours, minutes, seconds);
          if (seek_offset <= 30) {
             send_ir_key(Number0Button);
             break;
@@ -918,7 +941,7 @@ static int set_media_mode_ex(MEDIA_MODES_T mode, const char *url, int seek_offse
    case MEDIA_PHOTO:
       get_seconds(CLOCK_RESET);
       UrlEncode(url, cmd, MAX_SEND-1);
-
+      log_printf(LOG_MAIN, "Play URL %s\n", cmd);
       if (mode==MEDIA_PHOTO) {
          load_html(          "<body bgcolor=black link=black>"
                              "<center><img src=\"%s\" height=\"%d\"></center>"
@@ -949,7 +972,7 @@ static int set_media_mode_ex(MEDIA_MODES_T mode, const char *url, int seek_offse
    if (!position) position=&dummy_position;
    if (!duration) duration=&dummy_duration;
    assert(position && duration);
-   log_printf("### set_media_mode_ex(%s,%d)\n", modename[mode], seek_offset);
+   log_printf(LOG_MAIN, "### set_media_mode_ex(%s,%d)\n", modename[mode], seek_offset);
    if (last_mode == MEDIA_STOP && mode != MEDIA_STOP && mode != MEDIA_PLAY && mode != MEDIA_PHOTO && airplay_url[0])
       set_media_mode_ex(MEDIA_PLAY, airplay_url, seek_offset, position, duration);
    switch (mode) {
@@ -988,7 +1011,7 @@ static int set_media_mode_ex(MEDIA_MODES_T mode, const char *url, int seek_offse
    }
    //if (last_mode == MEDIA_STOP && mode != MEDIA_PLAY) send_command = 0;
    if (send_command) {
-      s = http_request(cmd);
+      s = http_request(LOG_MAIN, cmd);
       assert(s==0);
    }
    media_status = wait_media_ready(mode, last_mode, seek_offset, position, duration);
@@ -1056,7 +1079,7 @@ static int make_socket_in(uint16_t port)
    if (listen(sock, 1) < 0) {
       perror_abort("listen");
    }
-   log_printf("make_socket_in(:%d)=%d\n", port, sock);
+   log_printf(LOG_MAIN, "make_socket_in(:%d)=%d\n", port, sock);
    return sock;
 }
 
@@ -1088,7 +1111,7 @@ static int read_from_client(int filedes)
    assert(buffer && content && header);
    content[0] = '\0';
    header[0] = '\0';
-   nbytes = http_read_header(filedes, buffer, MAX_HEADER, &body, &body_size);
+   nbytes = http_read_header(LOG_MAIN, filedes, buffer, MAX_HEADER, &body, &body_size);
    if (nbytes > 0) {
       buffer[nbytes] = '\0';
    } else {
@@ -1142,7 +1165,7 @@ static int read_from_client(int filedes)
       }
       if (found) {
          fprintf (stderr, "Found content: %s\n", found);
-         UrlMangle(found, airplay_url, sizeof airplay_url, proxy);
+         UrlMangle(found, airplay_url, sizeof airplay_url, (proxy | proxyon) & ~proxyoff);
 #ifdef A100
          set_bookmark(airplay_url, last_scrub);
          set_media_mode_url(MEDIA_PLAY, airplay_url);
@@ -1209,7 +1232,7 @@ static int read_from_client(int filedes)
          assert(already_got >= 0);
          assert(photo);
          memcpy(photo, body, already_got);
-         s = socket_read(filedes, photo+already_got, body_size-already_got);
+         s = socket_read(LOG_MAIN, filedes, photo+already_got, body_size-already_got);
          assert(s==body_size-already_got);
          FILE *fp = fopen("/tmp/airplay_photo.jpg", "wb");
          assert(fp);
@@ -1222,7 +1245,7 @@ static int read_from_client(int filedes)
    } else if (found = strstr(buffer,"/volume"), found) {
       // ignore
    } else if (found = strstr(buffer,"/server-info"), found) {
-      sprintf(content, SERVER_INFO);
+      sprintf(content, SERVER_INFO, get_mac_addr());
       sprintf(header, "Content-Type: text/x-apple-plist+xml"NL);
    } else if (found = strstr(buffer,"/playback-info"), found) {
       int position=0, duration=0;
@@ -1244,11 +1267,15 @@ static int read_from_client(int filedes)
    } else if (found = strstr(buffer,"/authorize"), found) {
       load_html( HTML_REPORT_ERRROR2, "DRM protected content not supported", "");
       status = STATUS_NOT_IMPLEMENTED;
+   } else if (found = strstr(buffer,"/setProperty"), found) {
+      // just silently ignore for now
+   } else if (found = strstr(buffer,"/getProperty"), found) {
+      // just silently ignore for now
    } else {
       fprintf (stderr, "Unhandled [%s]\n", buffer);
       status = STATUS_NOT_IMPLEMENTED;
    }
-   if (status) http_response(filedes, status, http_status_string(status), content[0] ? content:NULL, header[0] ? header:NULL);
+   if (status) http_response(LOG_MAIN, filedes, status, http_status_string(status), content[0] ? content:NULL, header[0] ? header:NULL);
    fail:
    if (buffer) free(buffer);
    if (content) free(content);
@@ -1282,21 +1309,23 @@ Host: code.google.com
 
 static int read_from_proxy(int filedes)
 {
-   char *buffer = malloc(MAX_HEADER+1); // allow null on end
-   char *response_out = malloc(MAX_HEADER);
+   char *buffer = malloc(MAX_PROXY_BUFFER+1); // allow null on end
+   char *response_out = malloc(MAX_PROXY_BUFFER);
    int nbytes;
    char *found, *p;
    int status = STATUS_OK;
    char *body=0; int body_size = 0;
    assert(buffer);
    memset(&proxy, 0, sizeof proxy);
-   nbytes = http_read_header(filedes, buffer, MAX_HEADER, &body, &body_size);
+
+   nbytes = http_read_header(LOG_PROXY, filedes, buffer, MAX_PROXY_BUFFER, &body, &body_size);
    if (nbytes > 0) {
       buffer[nbytes] = '\0';
       assert(body_size == 0);
    } else {
       /* End-of-file. */
       assert(nbytes == 0);
+      log_printf(LOG_PROXY, "%d:http_read_header: %d\n", filedes, nbytes);
       status = 1;
       goto fail;
    }
@@ -1337,11 +1366,11 @@ static int read_from_proxy(int filedes)
                struct hostent *he;
                //printf("parsed [%s] to [%s]:%d (%d.%d.%d.%d)\n", buffer, found, proxy.port, (proxy.sin_addr.s_addr>>0)&0xff,(proxy.sin_addr.s_addr>>8)&0xff,(proxy.sin_addr.s_addr>>16)&0xff,(proxy.sin_addr.s_addr>>24)&0xff);
                if ((he = gethostbyname(proxy.host)) == NULL) {
-                  log_printf("parsed [%s] (%d.%d.%d.%d:%d)\n", proxy.host, (proxy.sin_addr.s_addr>>0)&0xff,(proxy.sin_addr.s_addr>>8)&0xff,(proxy.sin_addr.s_addr>>16)&0xff,(proxy.sin_addr.s_addr>>24)&0xff, proxy.port);
+                  log_printf(LOG_PROXY, "parsed [%s] (%d.%d.%d.%d:%d)\n", proxy.host, (proxy.sin_addr.s_addr>>0)&0xff,(proxy.sin_addr.s_addr>>8)&0xff,(proxy.sin_addr.s_addr>>16)&0xff,(proxy.sin_addr.s_addr>>24)&0xff, proxy.port);
                   perror_abort("error resolving hostname");
                }
                memcpy(&proxy.sin_addr, he->h_addr_list[0], sizeof proxy.sin_addr);
-               log_printf("parsed [%s] (%d.%d.%d.%d:%d)\n", proxy.host, (proxy.sin_addr.s_addr>>0)&0xff,(proxy.sin_addr.s_addr>>8)&0xff,(proxy.sin_addr.s_addr>>16)&0xff,(proxy.sin_addr.s_addr>>24)&0xff, proxy.port);
+               log_printf(LOG_PROXY, "parsed [%s] (%d.%d.%d.%d:%d)\n", proxy.host, (proxy.sin_addr.s_addr>>0)&0xff,(proxy.sin_addr.s_addr>>8)&0xff,(proxy.sin_addr.s_addr>>16)&0xff,(proxy.sin_addr.s_addr>>24)&0xff, proxy.port);
             }
             if (found_useragent) {
                found = found_useragent + STRLEN("useragent=");
@@ -1356,7 +1385,7 @@ static int read_from_proxy(int filedes)
                }
                strncpy(proxy.useragent, found, sizeof proxy.useragent);
                proxy.useragent[(sizeof proxy.useragent)-1] = '\0';
-               log_printf("parsed useragent [%s]\n", proxy.useragent);
+               log_printf(LOG_PROXY, "parsed useragent [%s]\n", proxy.useragent);
             }
          } else {
             if (strncasecmp(tok, "GET ", STRLEN("GET ")) == 0)
@@ -1375,7 +1404,7 @@ static int read_from_proxy(int filedes)
          d += sprintf(d, "User-Agent: %s"NL, proxy.useragent);
       } else {
          d += sprintf(d, "%s"NL, tok);
-         assert(d < response_out + MAX_HEADER);
+         assert(d < response_out + MAX_PROXY_BUFFER);
       }
       if (next_tok = strstr(last_tok, NL), next_tok) tok = last_tok, *next_tok = '\0', last_tok = next_tok + strlen(NL);
       else tok = NULL;
@@ -1395,23 +1424,32 @@ GET>
 OK<
 */
    assert(body_size == 0);
-   int s, sockfd = make_socket_out(proxy.sin_addr, proxy.port);
-   s = socket_write(sockfd, response_out, strlen(response_out));
-   assert(s == strlen(response_out));
+   int s, sockfd = make_socket_out(LOG_PROXY, proxy.sin_addr, proxy.port);
+   s = socket_write(LOG_PROXY, sockfd, response_out, strlen(response_out));
+   if (s != strlen(response_out))  {
+      error_printf(LOG_PROXY, "header: socket_write %d != %d\n", s, strlen(response_out));
+      status = 1; goto err_closed;
+   }
 
-   nbytes = http_read_header(sockfd, buffer, MAX_HEADER, &body, &body_size);
-   s = socket_write(filedes, buffer, nbytes);
-   assert(s == nbytes);
+   nbytes = http_read_header(LOG_PROXY, sockfd, buffer, MAX_PROXY_BUFFER, &body, &body_size);
+   s = socket_write(LOG_PROXY, filedes, buffer, nbytes);
+   if (s != nbytes) {
+      error_printf(LOG_PROXY, "content: socket_write %d != %d\n", s, nbytes);
+      status = 1; goto err_closed;
+   }
    const int header_length = body-buffer;
    int remaining = header_length + body_size - nbytes;
    while (remaining) {
-      int nbytes = socket_read(sockfd, buffer, min(remaining, MAX_HEADER));
-      if (nbytes < 0) goto err_closed;
-      else if (nbytes > 0) {
-         s = socket_write(filedes, buffer, nbytes);
+      int nbytes = socket_read(LOG_PROXY, sockfd, buffer, min(remaining, MAX_PROXY_BUFFER));
+      if (nbytes < 0) {
+         error_printf(LOG_PROXY, "content: socket_read %d != %d\n", nbytes, min(remaining, MAX_PROXY_BUFFER));
+         status = 1; goto err_closed;
+      } else if (nbytes > 0) {
+         s = socket_write(LOG_PROXY, filedes, buffer, nbytes);
          if (s != nbytes) {
-            error_printf("read_from_proxy(%d) sent %d/%d (%d remaining)\n", filedes, s, nbytes, remaining);
+            error_printf(LOG_PROXY, "read_from_proxy(%d) sent %d/%d (%d remaining)\n", filedes, s, nbytes, remaining);
             remaining = 0;
+            status = 1;
             break;
          }
          remaining -= nbytes;
@@ -1421,7 +1459,7 @@ OK<
    assert(remaining == 0);
    err_closed:
    close(sockfd);
-   status = 1;
+   //status = 1;
    fail:
    if (buffer) free(buffer);
    if (response_out) free(response_out);
@@ -1435,7 +1473,7 @@ static void *proxy_thread(void *arg)
    /* Create the socket and set it up to accept connections. */
    int sock = make_socket_in(PROXYPORT);
 
-   log_printf("proxy_thread. sock=%i\n", sock);
+   log_printf(LOG_MAIN, "proxy_thread. sock=%i\n", sock);
 
    /* Initialize the set of active sockets. */
    FD_ZERO(&active_fd_set);
@@ -1457,12 +1495,14 @@ static void *proxy_thread(void *arg)
                if (new_sock < 0) {
                   perror_abort("accept");
                }
-               log_printf("%i) Proxy: connect from (%s:%d)=%d\n", i, inet_ntoa(clientname_proxy.sin_addr), ntohs(clientname_proxy.sin_port), new_sock);
+               log_printf(LOG_PROXY, "%i) Proxy: connect from (%s:%d)=%d\n", i, inet_ntoa(clientname_proxy.sin_addr), ntohs(clientname_proxy.sin_port), new_sock);
                FD_SET(new_sock, &active_fd_set);
             } else {
+               int s = read_from_proxy(i);
+               log_printf(LOG_PROXY, "%i) read_from_proxy=%d\n", i, s);
                /* Data arriving on an already-connected socket. */
                //fprintf (stderr, "%i) Server: connect from existing socket\n", i);
-               if (read_from_proxy(i) < 0) {
+               if (s < 0) {
                   //fprintf (stderr, "%i) Server: connect from existing socket closed\n", i);
                   if (s = close(i), s != 0) {
                      perror_abort("socket close");
@@ -1485,8 +1525,12 @@ int main (int argc, char *argv[])
    fd_set active_fd_set, read_fd_set;
    pthread_t proxy_threadt;
 
-   if (argc > 1 && argv[1][0] == '-' && argv[1][1] == 'v') loglevel = 2;
+   for (i=1; i<argc; i++)   
+      if (argv[i][0] == '-' && argv[i][1] == 'v') loglevel = 2;
+      else if (argv[i][0] == '-' && argv[i][1] == 'p') proxyon = 1;
+      else if (argv[i][0] == '-' && argv[i][1] == 'q') proxyoff = 1;
 
+   log_printf(LOG_MAIN, "%s: loglevel=%d, proxyon=%d, proxyoff=%d\n", argv[0], loglevel, proxyon, proxyoff);
    s = pthread_create( &proxy_threadt, NULL, proxy_thread, NULL);
    assert(s==0);
 
@@ -1514,11 +1558,11 @@ int main (int argc, char *argv[])
                if (new_sock < 0) {
                   perror_abort("accept");
                }
-               log_printf("%i) Server: connect from (%s:%d)=%d\n", i, inet_ntoa(clientname.sin_addr), ntohs(clientname.sin_port), new_sock);
+               log_printf(LOG_MAIN, "%i) Server: connect from (%s:%d)=%d\n", i, inet_ntoa(clientname.sin_addr), ntohs(clientname.sin_port), new_sock);
                FD_SET(new_sock, &active_fd_set);
             } else {
                /* Data arriving on an already-connected socket. */
-               log_printf("%i) Server: connect from existing socket\n", i);
+               log_printf(LOG_MAIN, "%i) Server: connect from existing socket\n", i);
                if (read_from_client(i) < 0) {
                   //fprintf(stderr, "%i) Server: connect from existing socket closed\n", i);
                   close(i);

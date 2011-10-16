@@ -301,7 +301,7 @@
 <plist version=\"1.0\">\
 <dict>\
 <key>deviceid</key>\
-<string>58:55:CA:06:BD:9E</string>\
+<string>%s</string>\
 <key>features</key>\
 <integer>119</integer>\
 <key>model</key>\
