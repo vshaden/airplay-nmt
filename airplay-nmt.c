@@ -144,6 +144,9 @@ static char *get_mac_addr(void)
    return mac;
 }
 
+#define PROXY_PATH "http://127.0.0.1:7000/proxy?url="
+#define PROXY_PATH_QT "http://127.0.0.1:7000/proxy?useragent=Quicktime&url="
+
 static char *UrlMangle(const char *szText, char *szDst, int bufsize, int want_proxy)
 {
    char ch; 
@@ -154,12 +157,12 @@ static char *UrlMangle(const char *szText, char *szDst, int bufsize, int want_pr
    for (i = 0,j=0; szText[i] && j <= iMax; i++) {
       ch = szText[i];
       if (strncmp(szText+i, "http://trailers.apple.com", STRLEN("http://trailers.apple.com"))==0) {
-         strcpy(szDst+j, "http://127.0.0.1:7000/proxy?useragent=Quicktime&url=http");
-         j += STRLEN("http://127.0.0.1:7000/proxy?useragent=Quicktime&url=http");
+         strcpy(szDst+j, PROXY_PATH_QT "http");
+         j += STRLEN(PROXY_PATH_QT "http");
          i += STRLEN("http")-1;
       } else if (want_proxy && strncmp(szText+i, "http://", STRLEN("http://"))==0) {
-         strcpy(szDst+j, "http://127.0.0.1:7000/proxy?url=http");
-         j += STRLEN("http://127.0.0.1:7000/proxy?url=http");
+         strcpy(szDst+j, PROXY_PATH "http");
+         j += STRLEN(PROXY_PATH "http");
          i += STRLEN("http")-1;
       } else if (strncmp(szText+i, "://0.0.0.0", STRLEN("://0.0.0.0"))==0) {
          strcpy(szDst+j, "://");
@@ -185,7 +188,15 @@ static char *UrlEncode(const char *szText, char *szDst, int bufsize)
    szDst[0]='\0';
    for (i = 0,j=0; szText[i] && j <= iMax; i++) {
       ch = szText[i];
-      if (isalnum(ch) || ch=='/' || ch==':' || ch=='.' || ch=='_' || ch=='-' || ch=='~')
+      if (strncmp(szText+i, PROXY_PATH, STRLEN(PROXY_PATH))==0) {
+         strcpy(szDst+j, PROXY_PATH);
+         j += STRLEN(PROXY_PATH);
+         i += STRLEN(PROXY_PATH)-1;
+      } else if (strncmp(szText+i, PROXY_PATH_QT, STRLEN(PROXY_PATH_QT))==0) {
+         strcpy(szDst+j, PROXY_PATH_QT);
+         j += STRLEN(PROXY_PATH_QT);
+         i += STRLEN(PROXY_PATH_QT)-1;
+      } else if (isalnum(ch))// || ch=='/' || ch==':' || ch=='.' || ch=='_' || ch=='-' || ch=='~')
          szDst[j++]=ch;
       else if (ch == ' ')
          szDst[j++]='+';
@@ -199,6 +210,32 @@ static char *UrlEncode(const char *szText, char *szDst, int bufsize)
    }
    szDst[j]='\0';
    return szDst;
+}
+
+static int get_ip_addr(int log, const char *host, struct in_addr *sin_addr)
+{
+   struct hostent     *he;
+   if ((he = gethostbyname(host)) == NULL) {
+      error_printf(log, "http_request_with_response: gethostbyname(%s)=0\n", host);
+      return -1;
+   }
+   memcpy(sin_addr, he->h_addr_list[0], sizeof sin_addr);
+   return 0;
+}
+
+static int requires_proxy(int filedes, const char *url)
+{
+   struct in_addr sin_remote;
+   int log = LOG_MAIN;
+   char host[MAX_SEND];
+   int s = sscanf(url, "http://%[^:]s:", host);
+   log_printf(log, "requires_proxy: (%s)=%d\n", host, s);
+   if (s == 1 && get_ip_addr(log, host, &sin_remote)==0 ) {
+      log_printf(log, "requires_proxy: (%x)=%x\n", clientname.sin_addr.s_addr, sin_remote.s_addr);
+      if ((clientname.sin_addr.s_addr >> 8) == (sin_remote.s_addr >> 8))
+         return 1;
+   }
+   return 0;
 }
 
 static int ishex(char s)
@@ -236,6 +273,26 @@ static char *strnstr(const char *s1, const char *s2, size_t n)
    char *s = strstr(s1, s2);
    ((char *)s1)[n-1] = safe;
    return s;
+}
+
+/* Wat for input on socket with timeout. */
+static int wait_for_socket(int log, int sockfd, int timeout)
+{
+return 1;
+   fd_set rfds;
+   struct timeval tv;
+   int retval;
+   FD_ZERO(&rfds);
+   FD_SET(sockfd, &rfds);
+
+   /* Wait up to timeout microseconds. */
+   tv.tv_sec = timeout / 1000000;
+   tv.tv_usec = timeout % 1000000;
+
+   retval = select(1, &rfds, NULL, NULL, &tv);
+   /* Don’t rely on the value of tv now! */
+   log_printf(log, "wait_for_socket(%d)=%d\n", sockfd, retval);
+   return retval;
 }
 
 /* reads http header until response_size, NL NL or EOF.
@@ -359,7 +416,10 @@ static int make_socket_out(int log, struct in_addr sin_addr, int port)
    struct sockaddr_in  server;
    int s, sockfd = socket(AF_INET,SOCK_STREAM,0);
 
-   if (sockfd==-1) perror_abort("Create socket");
+   if (sockfd<0) {
+      error_printf(log, "make_socket_out(%d.%d.%d.%d:%d)=%d\n", (sin_addr.s_addr>>0)&0xff,(sin_addr.s_addr>>8)&0xff,(sin_addr.s_addr>>16)&0xff,(sin_addr.s_addr>>24)&0xff, port, sockfd);
+      return sockfd;
+   }
    /*
     * copy the network address part of the structure to the 
     * sockaddr_in structure which is passed to connect() 
@@ -370,7 +430,8 @@ static int make_socket_out(int log, struct in_addr sin_addr, int port)
 
    /* connect */
    if (s = connect(sockfd, (struct sockaddr *)&server, sizeof server), s) {
-      perror_abort("error connecting");
+      error_printf(log, "connect(%d.%d.%d.%d:%d)(%d)=%d\n", (sin_addr.s_addr>>0)&0xff,(sin_addr.s_addr>>8)&0xff,(sin_addr.s_addr>>16)&0xff,(sin_addr.s_addr>>24)&0xff, port, sockfd, s);
+      return -1;
    }
    log_printf(log, "make_socket_out(%d.%d.%d.%d:%d)=%d\n", (sin_addr.s_addr>>0)&0xff,(sin_addr.s_addr>>8)&0xff,(sin_addr.s_addr>>16)&0xff,(sin_addr.s_addr>>24)&0xff, port, sockfd);
    return sockfd;
@@ -380,6 +441,7 @@ static int make_socket_out(int log, struct in_addr sin_addr, int port)
 int sendCommandGetResponse(int log, struct in_addr sin_addr, int port, const char *cmd, char *response, int response_size)
 {
    int sockfd=make_socket_out(log, sin_addr, port);
+   if (sockfd < 0) return sockfd;
    int s = socket_write(log, sockfd, cmd, strlen(cmd));
    assert(s == strlen(cmd));
    int bytes_read = socket_read(log, sockfd, response, response_size);
@@ -387,20 +449,6 @@ int sendCommandGetResponse(int log, struct in_addr sin_addr, int port, const cha
    response[min(bytes_read, response_size-1)] = '\0';
    return 0;
 }
-
-
-#if 0
-static int sendCommand(int port, const char *cmd)
-{
-   struct in_addr sin_addr;
-   struct hostent     *he;
-   if ((he = gethostbyname("localhost")) == NULL) {
-      perror_abort("error resolving hostname");
-   }
-   memcpy(&sin_addr, he->h_addr_list[0], sizeof sin_addr);
-   return sendCommandGetResponse(sin_addr, port, cmd, NULL, 0);
-}
-#endif
 
 static void ignore_signal(int sig) {
    error_printf(LOG_MAIN, "Ignored signal %d\n", sig);
@@ -437,7 +485,8 @@ static int http_request_with_response(int log, const char *url, char *response, 
 
    struct hostent     *he;
    if ((he = gethostbyname(host)) == NULL) {
-      perror_abort("error resolving hostname..");
+      error_printf(log, "http_request_with_response: gethostbyname(%s)=0\n", host);
+      return -1;
    }
    memcpy(&sin_addr, he->h_addr_list[0], sizeof sin_addr);
    sprintf(command, 
@@ -581,7 +630,7 @@ static int readBTypeD(BPListState *s, int objLen) // Dictionary
 static int readBTypeX(BPListState *s, int objLen) // unimplemented
 {
    error_printf(LOG_MAIN, "bplist unimplemented(%d)\n", objLen);
-   assert(0);
+   return 0;
 }
 
 typedef int (*readBType_func_t)(BPListState *s, int objLen);
@@ -617,7 +666,7 @@ static char *bplist_find_content(char *body, int body_length, char **end)
    char *content = NULL;
    int i=0, size;
    BPListState static_s, *s=&static_s;
-
+   char *debug_out;
    assert(strncmp("bplist00", body, 8)==0);
    memset(s, 0, sizeof *s);
    s->p = (unsigned char *)body;
@@ -626,15 +675,18 @@ static char *bplist_find_content(char *body, int body_length, char **end)
    BPListTrailer *trailer = (BPListTrailer *)(body + body_length - sizeof *trailer);
    s->trailer = *trailer;
    if (WILL_LOG) {
-      char *debug_out = malloc(3*body_length+1);
+      debug_out = malloc(3*body_length+1);
       for (i=0; i<body_length; i++) {
          sprintf(debug_out+i, "%c", s->p[i]?s->p[i]:' ');
       }
-      s->trailer.objectCount = bplist_readInt(&trailer->objectCount, 1<<3);
-      s->trailer.topLevelObject = bplist_readInt(&trailer->topLevelObject, 1<<3);
-      s->trailer.offsetTableOffset= bplist_readInt(&trailer->offsetTableOffset, 1<<3);
-      log_printf(LOG_MAIN, "bplist_parse_content: offsetIntSize=%d, objectRefSize=%d, objectCount=%d, topLevelObject=%d, offsetTableOffset=%d\n[%.*s]\n", 
-                 (int)s->trailer.offsetIntSize, (int)s->trailer.objectRefSize, (int)s->trailer.objectCount, (int)s->trailer.topLevelObject, (int)s->trailer.offsetTableOffset, body_length, debug_out);
+   }
+   s->trailer.objectCount = bplist_readInt(&trailer->objectCount, 1<<3);
+   s->trailer.topLevelObject = bplist_readInt(&trailer->topLevelObject, 1<<3);
+   s->trailer.offsetTableOffset= bplist_readInt(&trailer->offsetTableOffset, 1<<3);
+   log_printf(LOG_MAIN, "bplist_parse_content: offsetIntSize=%d, objectRefSize=%d, objectCount=%d, topLevelObject=%d, offsetTableOffset=%d\n[%.*s]\n", 
+              (int)s->trailer.offsetIntSize, (int)s->trailer.objectRefSize, (int)s->trailer.objectCount, (int)s->trailer.topLevelObject, (int)s->trailer.offsetTableOffset, body_length, debug_out);
+
+   if (WILL_LOG) {
       for (i=0; i<body_length; i++) {
          sprintf(debug_out+i*3, "%02X ", s->p[i]);
       }
@@ -742,17 +794,24 @@ static void send_ir_keys(REMOTE_BUTTONS *code, int num)
    int s, sockfd;
    struct in_addr sin_addr;
    struct hostent     *he;
-   if ((he = gethostbyname("localhost")) == NULL) {
-      perror_abort("error resolving hostname");
+   int log=LOG_MAIN;
+   char *host="localhost";
+   if ((he = gethostbyname(host)) == NULL) {
+      error_printf(LOG_MAIN, "send_ir_keys: gethostbyname(%s)=0\n", host);
+      return;
    }
    memcpy(&sin_addr, he->h_addr_list[0], sizeof sin_addr);
 
    sockfd = make_socket_out(LOG_MAIN, sin_addr, 30000);
-   if (sockfd > 0) {
-      s = socket_write(LOG_MAIN, sockfd, (char *)code, num);
-      assert(s == num);
-      close(sockfd);
-   } else assert(0);
+   if (sockfd < 0) {
+      error_printf(log, "failed to send_ir_keys\n");
+      return;
+   }
+   s = socket_write(log, sockfd, (char *)code, num);
+   if (s != num) {
+      error_printf(log, "send_ir_keys: send(%d) %d!=%d\n", sockfd, s, num);
+   }
+   close(sockfd);
 }
 #endif
 static void send_ir_key(REMOTE_BUTTONS code)
@@ -1054,32 +1113,47 @@ static int set_media_mode(MEDIA_MODES_T mode)
 }
 
 
-static int make_socket_in(uint16_t port)
+static int make_socket_in(int log, uint16_t port)
 {
    struct sockaddr_in name;
-   int reuse_addr = 1;
+   int s, reuse_addr = 1;
+   struct linger {
+       int l_onoff;    /* linger active */
+       int l_linger;   /* how many seconds to linger for */
+   };
+   struct timeval tv;
+   tv.tv_sec = 0;
+   tv.tv_usec = 1;
+
+   struct linger linger;
+   linger.l_onoff = 1;
+   linger.l_linger = 1;
 
    /* Create the socket. */
    int sock = socket(PF_INET, SOCK_STREAM, 0);
    if (sock < 0) {
-      perror_abort("socket");
+      error_printf(log, "make_socket_in: socket(%d)=%d\n", port, sock);
+      return sock;
    }
-   setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse_addr, sizeof(reuse_addr));
-   setsockopt(sock, SOL_SOCKET, SO_LINGER, &reuse_addr, sizeof(reuse_addr));
-   setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &reuse_addr, sizeof(reuse_addr));
+   //setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse_addr, sizeof(reuse_addr));
+   //setsockopt(sock, SOL_SOCKET, SO_LINGER, &linger, sizeof(linger));
+   //setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+   //setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
    /* Give the socket a name. */
    memset((char *) &name, 0, sizeof name);
    name.sin_family = AF_INET;
    name.sin_port = htons(port);
    name.sin_addr.s_addr = htonl (INADDR_ANY);
-   if (bind(sock, (struct sockaddr *) &name, sizeof name) < 0) {
-      perror_abort("bind");
+   if (s = bind(sock, (struct sockaddr *) &name, sizeof name), s < 0) {
+      error_printf(log, "make_socket_in: bind(%d)=%d\n", sock, s);
+      return s;
    }
-   if (listen(sock, 1) < 0) {
-      perror_abort("listen");
+   if (s = listen(sock, 1), s < 0) {
+      error_printf(log, "make_socket_in: listen(%d)=%d\n", sock, s);
+      return s;
    }
-   log_printf(LOG_MAIN, "make_socket_in(:%d)=%d\n", port, sock);
+   log_printf(log, "make_socket_in(:%d)=%d\n", port, sock);
    return sock;
 }
 
@@ -1111,6 +1185,7 @@ static int read_from_client(int filedes)
    assert(buffer && content && header);
    content[0] = '\0';
    header[0] = '\0';
+
    nbytes = http_read_header(LOG_MAIN, filedes, buffer, MAX_HEADER, &body, &body_size);
    if (nbytes > 0) {
       buffer[nbytes] = '\0';
@@ -1134,15 +1209,8 @@ static int read_from_client(int filedes)
          last_scrub = -1;
       }
    } else if (found = strstr(buffer,"/play "), found) {
-      int proxy = a100;
       int binaryplist = strstr(buffer, "application/x-apple-binary-plist") != 0;
       if (!binaryplist) {
-         found = strstr(buffer, "User-Agent: ");
-         if (found) {
-            found += STRLEN("User-Agent: ");
-            if (strncmp(found, "iTunes", STRLEN("iTunes"))==0)
-               proxy=1;
-         }
          found = strstr(buffer, "Content-Location: ");
          if (found) {
             found += STRLEN("Content-Location: ");
@@ -1164,7 +1232,8 @@ static int read_from_client(int filedes)
          found = 0;
       }
       if (found) {
-         fprintf (stderr, "Found content: %s\n", found);
+         int proxy= requires_proxy(filedes, found);
+         fprintf (stderr, "Found content: %s (%d)\n", found, proxy);
          UrlMangle(found, airplay_url, sizeof airplay_url, (proxy | proxyon) & ~proxyoff);
 #ifdef A100
          set_bookmark(airplay_url, last_scrub);
@@ -1313,8 +1382,10 @@ static int read_from_proxy(int filedes)
    char *response_out = malloc(MAX_PROXY_BUFFER);
    int nbytes;
    char *found, *p;
-   int status = STATUS_OK;
+   int status = -1;
    char *body=0; int body_size = 0;
+   char *get = NULL;
+   int s, sockfd = -1;
    assert(buffer);
    memset(&proxy, 0, sizeof proxy);
 
@@ -1326,7 +1397,6 @@ static int read_from_proxy(int filedes)
       /* End-of-file. */
       assert(nbytes == 0);
       log_printf(LOG_PROXY, "%d:http_read_header: %d\n", filedes, nbytes);
-      status = 1;
       goto fail;
    }
    char *tok = buffer, *last_tok = buffer, *next_tok = NULL;
@@ -1337,6 +1407,14 @@ static int read_from_proxy(int filedes)
       if (strncasecmp(tok, "GET ", STRLEN("GET ")) == 0 || strncasecmp(tok, "HEAD ", STRLEN("HEAD ")) == 0 ) {
          char *url;
          UrlDecode(tok, tok);
+         if (get) {
+            error_printf(LOG_PROXY, "http_read_header: got second HEAD [%s]\n", tok);
+            break;
+         }
+         if (strncasecmp(tok, "HEAD ", STRLEN("HEAD ")) == 0 )
+            get="HEAD";
+         else if (strncasecmp(tok, "GET ", STRLEN("GET ")) == 0 )
+            get="GET";
          if (found = strstr(tok,"/proxy?"), found) {
             found += STRLEN("/proxy?");
             if (p = strstr(found, " HTTP/1."), p) {
@@ -1366,8 +1444,8 @@ static int read_from_proxy(int filedes)
                struct hostent *he;
                //printf("parsed [%s] to [%s]:%d (%d.%d.%d.%d)\n", buffer, found, proxy.port, (proxy.sin_addr.s_addr>>0)&0xff,(proxy.sin_addr.s_addr>>8)&0xff,(proxy.sin_addr.s_addr>>16)&0xff,(proxy.sin_addr.s_addr>>24)&0xff);
                if ((he = gethostbyname(proxy.host)) == NULL) {
-                  log_printf(LOG_PROXY, "parsed [%s] (%d.%d.%d.%d:%d)\n", proxy.host, (proxy.sin_addr.s_addr>>0)&0xff,(proxy.sin_addr.s_addr>>8)&0xff,(proxy.sin_addr.s_addr>>16)&0xff,(proxy.sin_addr.s_addr>>24)&0xff, proxy.port);
-                  perror_abort("error resolving hostname");
+                  error_printf(LOG_PROXY, "read_from_proxy: gethostbyname(%s)=0\n", proxy.host);
+                  goto fail;
                }
                memcpy(&proxy.sin_addr, he->h_addr_list[0], sizeof proxy.sin_addr);
                log_printf(LOG_PROXY, "parsed [%s] (%d.%d.%d.%d:%d)\n", proxy.host, (proxy.sin_addr.s_addr>>0)&0xff,(proxy.sin_addr.s_addr>>8)&0xff,(proxy.sin_addr.s_addr>>16)&0xff,(proxy.sin_addr.s_addr>>24)&0xff, proxy.port);
@@ -1394,7 +1472,9 @@ static int read_from_proxy(int filedes)
                url = tok + STRLEN("HEAD ");
             else assert(0);
          }
+         //d += sprintf(d, "%s %s HTTP/1.%c"NL, a100 || !get ? "GET":get, url, proxy.httpversion ? proxy.httpversion:'0');
          d += sprintf(d, "GET %s HTTP/1.%c"NL, url, proxy.httpversion ? proxy.httpversion:'0');
+
       } else if (strncasecmp(tok, "Host:", STRLEN("Host:")) == 0) {
          if (proxy.port == 80)
             d += sprintf(d, "Host: %s"NL, proxy.host);
@@ -1423,47 +1503,64 @@ GET>
              >OK
 OK<
 */
-   assert(body_size == 0);
-   int s, sockfd = make_socket_out(LOG_PROXY, proxy.sin_addr, proxy.port);
+   if (body_size != 0) {
+      error_printf(LOG_PROXY, "header: unexpected body_size = %d\n", body_size);
+      goto fail;
+   }
+   sockfd = make_socket_out(LOG_PROXY, proxy.sin_addr, proxy.port);
+   if (sockfd < 0) {
+      error_printf(LOG_PROXY, "header: make_socket_out = %d\n", sockfd);
+      goto fail;
+   }
    s = socket_write(LOG_PROXY, sockfd, response_out, strlen(response_out));
    if (s != strlen(response_out))  {
-      error_printf(LOG_PROXY, "header: socket_write %d != %d\n", s, strlen(response_out));
-      status = 1; goto err_closed;
+      error_printf(LOG_PROXY, "header: socket_write(%d) %d != %d\n", sockfd, s, strlen(response_out));
+      goto fail;
    }
-
+   s = wait_for_socket(LOG_PROXY, sockfd, 1000000);
+   if (s <= 0) {
+      error_printf(LOG_PROXY, "header: wait_for_socket(%d)=%d\n", sockfd, s);
+      goto fail;
+   }
    nbytes = http_read_header(LOG_PROXY, sockfd, buffer, MAX_PROXY_BUFFER, &body, &body_size);
    s = socket_write(LOG_PROXY, filedes, buffer, nbytes);
    if (s != nbytes) {
-      error_printf(LOG_PROXY, "content: socket_write %d != %d\n", s, nbytes);
-      status = 1; goto err_closed;
+      error_printf(LOG_PROXY, "header: socket_write(%d) %d != %d\n", filedes, s, nbytes);
+      goto fail;
    }
-   const int header_length = body-buffer;
+   const int header_length = body_size && body ? body-buffer:nbytes;
    int remaining = header_length + body_size - nbytes;
-   while (remaining) {
+   while (remaining > 0) {
+      s = wait_for_socket(LOG_PROXY, sockfd, 1000000);
+      if (s <= 0) {
+         error_printf(LOG_PROXY, "content: wait_for_socket(%d)=%d\n", sockfd, s);
+         goto fail;
+      }
       int nbytes = socket_read(LOG_PROXY, sockfd, buffer, min(remaining, MAX_PROXY_BUFFER));
       if (nbytes < 0) {
-         error_printf(LOG_PROXY, "content: socket_read %d != %d\n", nbytes, min(remaining, MAX_PROXY_BUFFER));
-         status = 1; goto err_closed;
+         error_printf(LOG_PROXY, "content: socket_read(%d) %d != %d\n", sockfd, nbytes, min(remaining, MAX_PROXY_BUFFER));
+         goto fail;
       } else if (nbytes > 0) {
          s = socket_write(LOG_PROXY, filedes, buffer, nbytes);
          if (s != nbytes) {
             error_printf(LOG_PROXY, "read_from_proxy(%d) sent %d/%d (%d remaining)\n", filedes, s, nbytes, remaining);
-            remaining = 0;
-            status = 1;
-            break;
+            goto fail;
          }
          remaining -= nbytes;
       }
       //fprintf(stderr, "%d/%d\n", nbytes, remaining);
    }
-   assert(remaining == 0);
-   err_closed:
-   close(sockfd);
-   //status = 1;
+   if (remaining != 0) {
+      log_printf(LOG_PROXY, "content: remaining=%d (%d=%d-%d) (%d=%d+%d-%d)\n", remaining, header_length, body, buffer, remaining, header_length, body_size, nbytes);
+      error_printf(LOG_PROXY, "content: remaining=%d (%d=%d-%d) (%d=%d+%d-%d)\n", remaining, header_length, body, buffer, remaining, header_length, body_size, nbytes);
+      goto fail;
+   }
+   status = STATUS_OK; // normal exit
    fail:
+   if (sockfd >= 0) close(sockfd);
    if (buffer) free(buffer);
    if (response_out) free(response_out);
-   return status==STATUS_OK || status==STATUS_SWITCHING_PROTOCOLS ? 0:-status;
+   return status;
 }
 
 static void *proxy_thread(void *arg)
@@ -1471,9 +1568,12 @@ static void *proxy_thread(void *arg)
    int i, s;
    fd_set active_fd_set, read_fd_set;
    /* Create the socket and set it up to accept connections. */
-   int sock = make_socket_in(PROXYPORT);
-
-   log_printf(LOG_MAIN, "proxy_thread. sock=%i\n", sock);
+   int sock = make_socket_in(LOG_PROXY, PROXYPORT);
+   if (sock < 0) {
+      error_printf(LOG_PROXY, "proxy_thread: Failed to create socket: sock=%i\n", sock);
+      return 0;
+   }
+   log_printf(LOG_PROXY, "proxy_thread. sock=%i\n", sock);
 
    /* Initialize the set of active sockets. */
    FD_ZERO(&active_fd_set);
@@ -1482,7 +1582,8 @@ static void *proxy_thread(void *arg)
       /* Block until input arrives on one or more active sockets. */
       read_fd_set = active_fd_set;
       if (s = select(FD_SETSIZE, &read_fd_set, NULL, NULL, NULL), s < 0) {
-         perror_abort("select");
+         error_printf(LOG_PROXY, "proxy_thread: select(%d)=%i\n", read_fd_set, s);
+         break;
       }
       //printf("select returns %i\n", s);
       /* Service all the sockets with input pending. */
@@ -1493,7 +1594,8 @@ static void *proxy_thread(void *arg)
                size_t size = sizeof clientname_proxy;
                int new_sock = accept(sock, (struct sockaddr *)&clientname_proxy, &size);
                if (new_sock < 0) {
-                  perror_abort("accept");
+                   error_printf(LOG_PROXY, "proxy_thread: accept(%d)=%i\n", sock, new_sock);
+                   continue;
                }
                log_printf(LOG_PROXY, "%i) Proxy: connect from (%s:%d)=%d\n", i, inet_ntoa(clientname_proxy.sin_addr), ntohs(clientname_proxy.sin_port), new_sock);
                FD_SET(new_sock, &active_fd_set);
@@ -1505,7 +1607,8 @@ static void *proxy_thread(void *arg)
                if (s < 0) {
                   //fprintf (stderr, "%i) Server: connect from existing socket closed\n", i);
                   if (s = close(i), s != 0) {
-                     perror_abort("socket close");
+                      error_printf(LOG_PROXY, "proxy_thread: close(%d)=%i\n", i, s);
+                      continue;
                   }
                   FD_CLR(i, &active_fd_set);
                }
@@ -1535,7 +1638,11 @@ int main (int argc, char *argv[])
    assert(s==0);
 
    /* Create the socket and set it up to accept connections. */
-   sock = make_socket_in(PORT);
+   sock = make_socket_in(LOG_MAIN, PORT);
+   if (sock < 0) {
+      error_printf(LOG_MAIN, "main: Failed to create socket: sock=%i\n", sock);
+      return -1;
+   }
 
    /* Initialize the set of active sockets. */
    FD_ZERO(&active_fd_set);
@@ -1545,7 +1652,8 @@ int main (int argc, char *argv[])
       /* Block until input arrives on one or more active sockets. */
       read_fd_set = active_fd_set;
       if (s = select(FD_SETSIZE, &read_fd_set, NULL, NULL, NULL), s < 0) {
-         perror_abort("select");
+          error_printf(LOG_MAIN, "main: select(%d)=%i\n", read_fd_set, s);
+          break;
       }
       //printf("select returns %i\n", s);
       /* Service all the sockets with input pending. */
@@ -1556,7 +1664,8 @@ int main (int argc, char *argv[])
                size_t size = sizeof clientname;
                int new_sock = accept(sock, (struct sockaddr *)&clientname, &size);
                if (new_sock < 0) {
-                  perror_abort("accept");
+                   error_printf(LOG_MAIN, "main: accept(%d)=%i\n", sock, new_sock);
+                   continue;
                }
                log_printf(LOG_MAIN, "%i) Server: connect from (%s:%d)=%d\n", i, inet_ntoa(clientname.sin_addr), ntohs(clientname.sin_port), new_sock);
                FD_SET(new_sock, &active_fd_set);
@@ -1565,7 +1674,10 @@ int main (int argc, char *argv[])
                log_printf(LOG_MAIN, "%i) Server: connect from existing socket\n", i);
                if (read_from_client(i) < 0) {
                   //fprintf(stderr, "%i) Server: connect from existing socket closed\n", i);
-                  close(i);
+                  if (s = close(i), s != 0) {
+                      error_printf(LOG_MAIN, "main: close(%d)=%i\n", i, s);
+                      continue;
+                  }
                   FD_CLR(i, &active_fd_set);
                }
             }
