@@ -87,7 +87,7 @@ enum {
 
 static char airplay_url[MAX_SEND];
 
-static int proxyon=1, proxyoff;
+static int proxyon, proxyoff;
 static int loglevel=1;
 
 enum {LOG_PROXY, LOG_MAIN };
@@ -223,14 +223,34 @@ static int get_ip_addr(int log, const char *host, struct in_addr *sin_addr)
    return 0;
 }
 
+static int parse_host(const char *url, char *host, int len)
+{
+   const char *p = url;
+   if (strncmp(url, "http://", STRLEN("http://")) != 0)
+      return -1;
+   p += STRLEN("http://");
+   char *colon = strchr(p, ':');
+   char *slash = strchr(p, '/');
+   char *q = slash && colon ? min(slash, colon) : max(slash, colon);
+   if (!q)
+      return -1;
+   int l = min(q-p, len-1);
+   strncpy(host, p, l);
+   host[l] = '\0';
+   return 0;
+}
+
 static int requires_proxy(int filedes, const char *url)
 {
    struct in_addr sin_remote;
    int log = LOG_MAIN;
    char host[MAX_SEND];
-   int s = sscanf(url, "http://%[^:]s:", host);
-   log_printf(log, "requires_proxy: (%s)=%d\n", host, s);
-   if (s == 1 && get_ip_addr(log, host, &sin_remote)==0 ) {
+   int s = parse_host(url, host, sizeof host);
+   if (s < 0) {
+      error_printf(log, "failed to parse_host(%s)\n", url);
+      return -1;
+   }
+   if (get_ip_addr(log, host, &sin_remote)==0 ) {
       log_printf(log, "requires_proxy: (%x)=%x\n", clientname.sin_addr.s_addr, sin_remote.s_addr);
       if ((clientname.sin_addr.s_addr >> 8) == (sin_remote.s_addr >> 8))
          return 1;
@@ -473,9 +493,12 @@ static int http_request_with_response(int log, const char *url, char *response, 
    char host[MAX_SEND] = "localhost";
    char *p;
    int port = 80;
-   int s;
    struct in_addr sin_addr;
-   s = sscanf(url, "http://%[^:]s:", host);
+   int s = parse_host(url, host, sizeof host);
+   if (s < 0) {
+      error_printf(log, "failed to parse_host(%s)\n", url);
+      return -1;
+   }
    p = strstr(url, "//");
    if (p) p = strstr(p, ":");
    if (p) port = atoi(p+1);
@@ -532,7 +555,8 @@ typedef struct BPListState {
    unsigned char *p;
    int i; // current offset
    int body_length;
-   char *content, *end;
+   char *content, *content_end;
+   float position;
    BPListTrailer trailer;
 } BPListState;
 
@@ -565,7 +589,7 @@ static int readBType1(BPListState *s, int objLen) // int
 
 static int readBType2(BPListState *s, int objLen) // real
 {
-   int ans = 0;
+   int ans = bplist_readInt(s->p+s->i, 1<<objLen);
    s->i += 1<<objLen;
    return ans;
 }
@@ -622,7 +646,9 @@ static int readBTypeD(BPListState *s, int objLen) // Dictionary
       char *prop  = (char *)s->p + (propans & 0xffff);
       char *value = (char *)s->p + (valueans & 0xffff);
       if (strncmp(prop, "Content-Location", STRLEN("Content-Location"))==0)
-         s->content = value, s->end = value + (valueans>>16);
+         s->content = value, s->content_end = value + (valueans>>16);
+      else if (strncmp(prop, "Start-Position", STRLEN("Start-Position"))==0)
+         s->position = *(float *)&valueans;
    }
    return ans;
 }
@@ -661,7 +687,7 @@ static int ReadBObjectAt(BPListState *s, int objNum)
 }
 
 
-static char *bplist_find_content(char *body, int body_length, char **end)
+static char *bplist_find_content(char *body, int body_length, char **content_end, float *position)
 {
    char *content = NULL;
    int i=0, size;
@@ -695,7 +721,8 @@ static char *bplist_find_content(char *body, int body_length, char **end)
    }
 
    ReadBObjectAt(s, s->trailer.topLevelObject);
-   *end = s->end;
+   *content_end = s->content_end;
+   *position = s->position;
    return s->content;
 }
 
@@ -942,7 +969,7 @@ static int set_media_mode_ex(MEDIA_MODES_T mode, const char *url, int seek_offse
    if (!position) position=&dummy_position;
    if (!duration) duration=&dummy_duration;
 
-   log_printf(LOG_MAIN, "### set_media_mode_ex(%s,%d)\n", modename[mode], seek_offset);
+   log_printf(LOG_MAIN, "### set_media_mode_ex(%s->%s,%d)\n", modename[mode], modename[last_mode], seek_offset);
    if (last_mode == MEDIA_STOP && mode != MEDIA_STOP && mode != MEDIA_PLAY && mode != MEDIA_PHOTO && airplay_url[0])
       set_media_mode_ex(MEDIA_PLAY, airplay_url, seek_offset, position, duration);
    switch (mode) {
@@ -1031,8 +1058,8 @@ static int set_media_mode_ex(MEDIA_MODES_T mode, const char *url, int seek_offse
    if (!position) position=&dummy_position;
    if (!duration) duration=&dummy_duration;
    assert(position && duration);
-   log_printf(LOG_MAIN, "### set_media_mode_ex(%s,%d)\n", modename[mode], seek_offset);
-   if (last_mode == MEDIA_STOP && mode != MEDIA_STOP && mode != MEDIA_PLAY && mode != MEDIA_PHOTO && airplay_url[0])
+   log_printf(LOG_MAIN, "### set_media_mode_ex(%s->%s,%d)\n", modename[mode], modename[last_mode], seek_offset);
+   if ((last_mode == MEDIA_STOP || last_mode == MEDIA_PHOTO) && mode != MEDIA_STOP && mode != MEDIA_PLAY && mode != MEDIA_PHOTO && airplay_url[0])
       set_media_mode_ex(MEDIA_PLAY, airplay_url, seek_offset, position, duration);
    switch (mode) {
    case MEDIA_STOP:
@@ -1135,7 +1162,8 @@ static int make_socket_in(int log, uint16_t port)
       error_printf(log, "make_socket_in: socket(%d)=%d\n", port, sock);
       return sock;
    }
-   //setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse_addr, sizeof(reuse_addr));
+   // reuse allow quit and restart without bind error
+   setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse_addr, sizeof(reuse_addr));
    //setsockopt(sock, SOL_SOCKET, SO_LINGER, &linger, sizeof(linger));
    //setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
    //setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
@@ -1210,9 +1238,13 @@ static int read_from_client(int filedes)
       }
    } else if (found = strstr(buffer,"/play "), found) {
       int binaryplist = strstr(buffer, "application/x-apple-binary-plist") != 0;
+      float fposition = 0.0f;
       if (!binaryplist) {
-         found = strstr(buffer, "Content-Location: ");
-         if (found) {
+         if (found = strstr(buffer, "Start-Position: "), found) {
+            found += STRLEN("Start-Position: ");
+            fposition = atof(found);
+         }
+         if (found = strstr(buffer, "Content-Location: "), found) {
             found += STRLEN("Content-Location: ");
             char *newline = strchr(found, '\n');
             if (newline) *newline = '\0';
@@ -1221,7 +1253,7 @@ static int read_from_client(int filedes)
       } else {
          int length=0;
          char *end = NULL;
-         found = bplist_find_content(body, body_size, &end);
+         found = bplist_find_content(body, body_size, &end, &fposition);
          if (found) {
             if (end) *end = '\0';
             else found = 0;
@@ -1233,7 +1265,7 @@ static int read_from_client(int filedes)
       }
       if (found) {
          int proxy= requires_proxy(filedes, found);
-         fprintf (stderr, "Found content: %s (%d)\n", found, proxy);
+         fprintf (stderr, "Found content: %s (%d) (%f)\n", found, proxy, fposition);
          UrlMangle(found, airplay_url, sizeof airplay_url, (proxy | proxyon) & ~proxyoff);
 #ifdef A100
          set_bookmark(airplay_url, last_scrub);
@@ -1385,6 +1417,7 @@ static int read_from_proxy(int filedes)
    int status = -1;
    char *body=0; int body_size = 0;
    char *get = NULL;
+   int range = 0;
    int s, sockfd = -1;
    assert(buffer);
    memset(&proxy, 0, sizeof proxy);
@@ -1482,10 +1515,19 @@ static int read_from_proxy(int filedes)
             d += sprintf(d, "Host: %s:%d"NL, proxy.host, proxy.port);
       } else if (strncasecmp(tok, "User-Agent:", STRLEN("User-Agent:")) == 0 && proxy.useragent[0]) {
          d += sprintf(d, "User-Agent: %s"NL, proxy.useragent);
+      } else if (strncasecmp(tok, "Range:", STRLEN("Range:")) == 0) {
+         range = 1;
+         d += sprintf(d, "%s"NL, tok);
+      } else if (strlen(tok) == 0) {
+         // add dummy range if not requested
+         if (strcmp(get, "HEAD")==0 && !range) {
+            //d += sprintf(d, "Range: bytes=0-1"NL);
+         }
+         d += sprintf(d, "%s"NL, tok);
       } else {
          d += sprintf(d, "%s"NL, tok);
-         assert(d < response_out + MAX_PROXY_BUFFER);
       }
+      assert(d < response_out + MAX_PROXY_BUFFER);
       if (next_tok = strstr(last_tok, NL), next_tok) tok = last_tok, *next_tok = '\0', last_tok = next_tok + strlen(NL);
       else tok = NULL;
    }
@@ -1685,4 +1727,5 @@ int main (int argc, char *argv[])
       }
    }
 }
+
 
